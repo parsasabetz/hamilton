@@ -16,6 +16,7 @@ import {
   renderBrief,
   renderGraphYaml,
   startCore,
+  startRunOn,
 } from "@hamilton/core"
 import type { Decomposer, TaskGraph } from "@hamilton/core"
 
@@ -278,10 +279,13 @@ export async function runHamilton(options: RunOptions): Promise<RunResult> {
   })
   try {
     const parent = process.env.HAMILTON_PARENT_BRANCH ?? DEFAULT_PARENT_BRANCH
-    await handle.emit({
-      type: "run.planned",
+    await startRunOn(handle, {
       runId,
-      payload: { tasks: graph.tasks, parent },
+      graph,
+      parent,
+      ...(options.mergeAuthority !== undefined
+        ? { mergeAuthority: options.mergeAuthority }
+        : {}),
     })
     console.log(
       `run ${runId} seeded (parent ${parent}); watching ` +

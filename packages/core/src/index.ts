@@ -4,7 +4,7 @@
 
 import { getLogger } from "@logtape/logtape"
 import { hamiltonEventTypes } from "@hamilton/shared"
-import type { HamiltonEvent } from "@hamilton/shared"
+import type { HamiltonConfig, HamiltonEvent, TaskGraph } from "@hamilton/shared"
 
 import { createBridge } from "./bridge.ts"
 import { loadConfigFile, resolveConfig } from "./config.ts"
@@ -14,12 +14,14 @@ import { createBus } from "./eventbus.ts"
 import type { EmitInput } from "./eventbus.ts"
 import { configureHamiltonLogging } from "./logging.ts"
 import { createControlPlane } from "./opencode.ts"
+import { parsePlanJson, startRunOn } from "./runner.ts"
 import { createBrain } from "./runtime.ts"
 import { statusPage } from "./status-page.ts"
+import { summarizeRun } from "./summarize.ts"
+import type { RunSnapshotLike } from "./summarize.ts"
 import { createWorktreeWatcher } from "./worktrees.ts"
 import { worktreeSection } from "./tree-graph.ts"
 import type { BranchState } from "./tree-graph.ts"
-import type { HamiltonConfig } from "@hamilton/shared"
 
 export * from "./bridge.ts"
 export * from "./config.ts"
@@ -30,8 +32,10 @@ export * from "./git.ts"
 export * from "./logging.ts"
 export * from "./opencode.ts"
 export * from "./planner.ts"
+export * from "./runner.ts"
 export * from "./runtime.ts"
 export * from "./status-page.ts"
+export * from "./summarize.ts"
 export * from "./tree-graph.ts"
 export * from "./worktrees.ts"
 export type {
@@ -184,6 +188,9 @@ export async function startCore(
   // other session (implementers) gets the implementer policy. The set is fed
   // from review.assigned events (mock and real sessions alike).
   const reviewerSessions = new Set<string>()
+  // sessionId → the session's task branch (from task.dispatched) — the
+  // permission policy allows pushing ONLY the session's own branch.
+  const sessionBranches = new Map<string, string>()
   bus.subscribe((event) => {
     if (event.type === "review.assigned" && isRecord(event.payload)) {
       const reviewers = event.payload["reviewers"]
@@ -195,15 +202,35 @@ export async function startCore(
         }
       }
     }
+    if (event.type === "task.dispatched" && isRecord(event.payload)) {
+      const branch = optionalString(event.payload, "branch")
+      if (branch && event.agentId !== undefined) {
+        sessionBranches.set(event.agentId, branch)
+      }
+    }
   })
   const responder = createPermissionResponder({
     controlPlane,
     roleForSession: (sessionId) =>
       reviewerSessions.has(sessionId) ? "reviewer" : "implementer",
+    branchForSession: (sessionId) => sessionBranches.get(sessionId),
   })
   bus.subscribe((event) => {
     void responder.handleTelemetry(event)
   })
+
+  const handle: CoreHandle = {
+    url: "",
+    brain,
+    emit: (input) => bus.emit(input),
+    async stop(): Promise<void> {
+      logger.info("Core stopping")
+      bridge?.stop()
+      watcher.stop()
+      server.stop(true)
+      await brain.dispose()
+    },
+  }
 
   const server = Bun.serve({
     port,
@@ -254,6 +281,79 @@ export async function startCore(
         const snapshot = await brain.readRunState(runId)
         const tail = await bus.tail(runId, 20)
         return Response.json({ snapshot, tail })
+      }
+
+      if (url.pathname === "/api/run" && request.method === "POST") {
+        const body = await jsonBody(request)
+        if (!isRecord(body)) {
+          return Response.json({ error: "invalid JSON body" }, { status: 400 })
+        }
+        const planJson = optionalString(body, "planJson")
+        const prompt = optionalString(body, "prompt")
+        if (planJson === undefined && prompt === undefined) {
+          return Response.json(
+            {
+              error: 'start_run requires exactly one of "planJson" or "prompt"',
+            },
+            { status: 400 },
+          )
+        }
+        if (planJson !== undefined && prompt !== undefined) {
+          return Response.json(
+            { error: 'start_run accepts "planJson" OR "prompt", not both' },
+            { status: 400 },
+          )
+        }
+        if (planJson === undefined) {
+          return Response.json(
+            {
+              error:
+                "prompt decomposition not wired in this core; provide planJson " +
+                "(the MCP/CLI path decomposes prompts via the planner session)",
+            },
+            { status: 400 },
+          )
+        }
+        let graph: TaskGraph
+        try {
+          graph = parsePlanJson(planJson)
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error)
+          return Response.json({ error: detail }, { status: 400 })
+        }
+        const runId = optionalString(body, "runId") ?? `run-${Date.now()}`
+        const runParent =
+          optionalString(body, "parent") ??
+          process.env.HAMILTON_PARENT_BRANCH ??
+          config.parentBranch
+        const rawAuthority = body["mergeAuthority"]
+        const mergeAuthority =
+          rawAuthority === "autonomous" || rawAuthority === "owner-gated"
+            ? rawAuthority
+            : undefined
+        await startRunOn(handle, {
+          runId,
+          graph,
+          parent: runParent,
+          ...(mergeAuthority !== undefined ? { mergeAuthority } : {}),
+        })
+        return Response.json({
+          runId,
+          parent: runParent,
+          tasks: graph.tasks.length,
+        })
+      }
+
+      if (url.pathname === "/api/run-status") {
+        const runId = url.searchParams.get("run") ?? defaultRunId
+        const raw = await brain.readRunState(runId)
+        if (raw === null) {
+          return Response.json(
+            { error: `run ${runId} not found` },
+            { status: 404 },
+          )
+        }
+        return Response.json(summarizeRun(raw as RunSnapshotLike))
       }
 
       if (url.pathname === "/api/worktrees") {
@@ -318,22 +418,11 @@ export async function startCore(
   })
 
   if (bridge) void bridge.start()
-  const url = `http://localhost:${server.port}`
+  handle.url = `http://localhost:${server.port}`
   logger.info("Core listening on {url} (run {runId}, persist {persistDir})", {
-    url,
+    url: handle.url,
     runId: defaultRunId,
     persistDir,
   })
-  return {
-    url,
-    brain,
-    emit: (input) => bus.emit(input),
-    async stop(): Promise<void> {
-      logger.info("Core stopping")
-      bridge?.stop()
-      watcher.stop()
-      server.stop(true)
-      await brain.dispose()
-    },
-  }
+  return handle
 }
