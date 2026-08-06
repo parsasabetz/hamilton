@@ -107,6 +107,37 @@ async function fakeAgent(taskId: string, worktreePath: string): Promise<void> {
   console.log(`  fake agent ${taskId}: ready_for_review declared`)
 }
 
+// M3 gate: the fake reviewers pass the task (one submission per role).
+const REVIEW_ROLES = ["correctness", "standards"]
+
+async function fakeReviewers(taskId: string): Promise<void> {
+  for (let idx = 0; idx < REVIEW_ROLES.length; idx += 1) {
+    await fetch(`http://localhost:${PORT}/api/events`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        type: "review.submitted",
+        runId: RUN_ID,
+        taskId,
+        agentId: `review-${taskId}-${idx}`,
+        payload: {
+          reviewer: REVIEW_ROLES[idx],
+          idx,
+          verdict: "pass",
+          findings: [],
+          checksRun: [
+            { name: "typecheck", ok: true },
+            { name: "tests", ok: true },
+          ],
+          summary: `${taskId} passes (demo)`,
+        },
+      }),
+    })
+    await Bun.sleep(120)
+  }
+  console.log(`  fake reviewers ${taskId}: pass`)
+}
+
 function branchRow(
   snapshot: Snapshot,
   branch: string,
@@ -211,6 +242,14 @@ async function main(): Promise<void> {
             console.log(`  no worktree row yet for ${id}; retrying`)
             dispatchOrder.pop()
           }
+        }
+        if (
+          task["status"] === "reviewing" &&
+          !dispatchOrder.includes(`${id}:reviewed`)
+        ) {
+          dispatchOrder.push(`${id}:reviewed`)
+          // oxlint-disable-next-line no-await-in-loop -- sequential reviewer drive
+          await fakeReviewers(id)
         }
         if (
           task["status"] === "merged" &&
