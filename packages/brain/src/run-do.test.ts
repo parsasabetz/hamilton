@@ -4,8 +4,13 @@
 
 import { describe, expect, mock, test } from "bun:test"
 
-import type { HamiltonEvent, Task, TaskStatus } from "@hamilton/shared"
-import type { RunSnapshot } from "./run-do.ts"
+import type {
+  HamiltonConfig,
+  HamiltonEvent,
+  Task,
+  TaskStatus,
+} from "@hamilton/shared"
+import type { AgentRunState, RunSnapshot } from "./run-do.ts"
 
 mock.module("cloudflare:workers", () => ({
   DurableObject: class {
@@ -15,8 +20,18 @@ mock.module("cloudflare:workers", () => ({
   },
 }))
 
-const { applyEvent, forwardTargets, parseTask, parseTaskStatus } =
-  await import("./run-do.ts")
+const {
+  agentLogKey,
+  applyEvent,
+  extractBashCommand,
+  findZoneViolation,
+  forwardTargets,
+  parseTask,
+  parseTaskStatus,
+  recordCommand,
+  recordViolation,
+  shouldStop,
+} = await import("./run-do.ts")
 
 const empty: RunSnapshot = { tasks: {}, agents: {}, phase: "planned" }
 
@@ -69,7 +84,12 @@ describe("applyEvent", () => {
     const start = {
       ...empty,
       tasks: {
-        t1: { id: "t1", status: "in-progress" as TaskStatus, role: "" },
+        t1: {
+          id: "t1",
+          status: "in-progress" as TaskStatus,
+          role: "",
+          zone: [],
+        },
       },
     }
     const next = applyEvent(
@@ -86,7 +106,12 @@ describe("applyEvent", () => {
     const start = {
       ...empty,
       tasks: {
-        t1: { id: "t1", status: "in-progress" as TaskStatus, role: "" },
+        t1: {
+          id: "t1",
+          status: "in-progress" as TaskStatus,
+          role: "",
+          zone: [],
+        },
       },
     }
     const next = applyEvent(
@@ -103,7 +128,12 @@ describe("applyEvent", () => {
     const start = {
       ...empty,
       tasks: {
-        t1: { id: "t1", status: "in-progress" as TaskStatus, role: "" },
+        t1: {
+          id: "t1",
+          status: "in-progress" as TaskStatus,
+          role: "",
+          zone: [],
+        },
       },
     }
     expect(
@@ -124,7 +154,12 @@ describe("applyEvent", () => {
     const start = {
       ...empty,
       tasks: {
-        t1: { id: "t1", status: "planned" as TaskStatus, role: "implementer" },
+        t1: {
+          id: "t1",
+          status: "planned" as TaskStatus,
+          role: "implementer",
+          zone: [],
+        },
       },
     }
     const next = applyEvent(
@@ -140,7 +175,12 @@ describe("applyEvent", () => {
     const start = {
       ...empty,
       tasks: {
-        t1: { id: "t1", status: "ready-for-review" as TaskStatus, role: "" },
+        t1: {
+          id: "t1",
+          status: "ready-for-review" as TaskStatus,
+          role: "",
+          zone: [],
+        },
       },
     }
     const next = applyEvent(
@@ -154,9 +194,23 @@ describe("applyEvent", () => {
   test("agent.milestone records agent activity and task last event", () => {
     const start = {
       tasks: {
-        t1: { id: "t1", status: "in-progress" as TaskStatus, role: "" },
+        t1: {
+          id: "t1",
+          status: "in-progress" as TaskStatus,
+          role: "",
+          zone: [],
+        },
       },
-      agents: { a1: { agentId: "a1", taskId: "t1", state: "started" } },
+      agents: {
+        a1: {
+          agentId: "a1",
+          taskId: "t1",
+          state: "started",
+          failures: 0,
+          zoneViolations: 0,
+          milestoneCount: 0,
+        },
+      },
       phase: "running",
     }
     const next = applyEvent(
@@ -171,7 +225,16 @@ describe("applyEvent", () => {
   test("agent.heartbeat records heartbeatAt", () => {
     const start = {
       ...empty,
-      agents: { a1: { agentId: "a1", taskId: "t1", state: "started" } },
+      agents: {
+        a1: {
+          agentId: "a1",
+          taskId: "t1",
+          state: "started",
+          failures: 0,
+          zoneViolations: 0,
+          milestoneCount: 0,
+        },
+      },
     }
     const next = applyEvent(start, evt("agent.heartbeat", { agentId: "a1" }))
     expect(next.agents["a1"]?.heartbeatAt).toBe("2026-08-06T00:00:00.000Z")
@@ -180,9 +243,23 @@ describe("applyEvent", () => {
   test("agent.ready_for_review moves task and agent to ready", () => {
     const start = {
       tasks: {
-        t1: { id: "t1", status: "in-progress" as TaskStatus, role: "" },
+        t1: {
+          id: "t1",
+          status: "in-progress" as TaskStatus,
+          role: "",
+          zone: [],
+        },
       },
-      agents: { a1: { agentId: "a1", taskId: "t1", state: "started" } },
+      agents: {
+        a1: {
+          agentId: "a1",
+          taskId: "t1",
+          state: "started",
+          failures: 0,
+          zoneViolations: 0,
+          milestoneCount: 0,
+        },
+      },
       phase: "running",
     }
     const next = applyEvent(
@@ -196,7 +273,15 @@ describe("applyEvent", () => {
   test("agent liveness events update the agent", () => {
     const start = {
       ...empty,
-      agents: { a1: { agentId: "a1", state: "started" } },
+      agents: {
+        a1: {
+          agentId: "a1",
+          state: "started",
+          failures: 0,
+          zoneViolations: 0,
+          milestoneCount: 0,
+        },
+      },
     }
     expect(
       applyEvent(start, evt("agent.stalled", { agentId: "a1" })).agents["a1"]
@@ -232,7 +317,12 @@ describe("applyEvent", () => {
     const start = {
       ...empty,
       tasks: {
-        t1: { id: "t1", status: "ready-for-review" as TaskStatus, role: "" },
+        t1: {
+          id: "t1",
+          status: "ready-for-review" as TaskStatus,
+          role: "",
+          zone: [],
+        },
       },
     }
     expect(
@@ -248,7 +338,9 @@ describe("applyEvent", () => {
   test("review.verdict pass approves, anything else sends back to in-progress", () => {
     const start = {
       ...empty,
-      tasks: { t1: { id: "t1", status: "reviewing" as TaskStatus, role: "" } },
+      tasks: {
+        t1: { id: "t1", status: "reviewing" as TaskStatus, role: "", zone: [] },
+      },
     }
     expect(
       applyEvent(
@@ -283,12 +375,19 @@ describe("forwardTargets", () => {
     const prev = {
       ...empty,
       tasks: {
-        t1: { id: "t1", status: "in-progress" as TaskStatus, role: "" },
+        t1: {
+          id: "t1",
+          status: "in-progress" as TaskStatus,
+          role: "",
+          zone: [],
+        },
       },
     }
     const next = {
       ...prev,
-      tasks: { t1: { id: "t1", status: "blocked" as TaskStatus, role: "" } },
+      tasks: {
+        t1: { id: "t1", status: "blocked" as TaskStatus, role: "", zone: [] },
+      },
     }
     const targets = forwardTargets(
       prev,
@@ -304,12 +403,19 @@ describe("forwardTargets", () => {
   test("emits agent register for claimed/started", () => {
     const prev = {
       ...empty,
-      tasks: { t1: { id: "t1", status: "planned" as TaskStatus, role: "" } },
+      tasks: {
+        t1: { id: "t1", status: "planned" as TaskStatus, role: "", zone: [] },
+      },
     }
     const next = {
       ...prev,
       tasks: {
-        t1: { id: "t1", status: "in-progress" as TaskStatus, role: "" },
+        t1: {
+          id: "t1",
+          status: "in-progress" as TaskStatus,
+          role: "",
+          zone: [],
+        },
       },
     }
     const targets = forwardTargets(
@@ -333,7 +439,15 @@ describe("forwardTargets", () => {
   test("maps agent liveness events to endpoints", () => {
     const start = {
       ...empty,
-      agents: { a1: { agentId: "a1", state: "started" } },
+      agents: {
+        a1: {
+          agentId: "a1",
+          state: "started",
+          failures: 0,
+          zoneViolations: 0,
+          milestoneCount: 0,
+        },
+      },
     }
     expect(
       forwardTargets(start, start, evt("agent.heartbeat", { agentId: "a1" })),
@@ -405,9 +519,18 @@ describe("helpers", () => {
           id: "t1",
           status: "in-progress" as TaskStatus,
           role: "implementer",
+          zone: [],
         },
       },
-      agents: { a1: { agentId: "a1", state: "started" } },
+      agents: {
+        a1: {
+          agentId: "a1",
+          state: "started",
+          failures: 0,
+          zoneViolations: 0,
+          milestoneCount: 0,
+        },
+      },
       phase: "running",
     }
     const next = applyEvent(start, evt("run.pause"))
@@ -419,11 +542,374 @@ describe("helpers", () => {
   test("tasks is a fresh object each transition (pure)", () => {
     const start = {
       ...empty,
-      tasks: { t1: { id: "t1", status: "planned" as TaskStatus, role: "" } },
+      tasks: {
+        t1: { id: "t1", status: "planned" as TaskStatus, role: "", zone: [] },
+      },
     }
     const next = applyEvent(start, evt("task.merged", { taskId: "t1" }))
     expect(next).not.toBe(start)
     expect(next.tasks).not.toBe(start.tasks)
     expect(start.tasks["t1"]?.status).toBe("planned")
+  })
+})
+
+const agentState = (
+  agentId: string,
+  state: string,
+  overrides: Partial<AgentRunState> = {},
+): AgentRunState => ({
+  agentId,
+  state,
+  failures: 0,
+  zoneViolations: 0,
+  milestoneCount: 0,
+  ...overrides,
+})
+
+const testConfig = (
+  earlyStop: HamiltonConfig["earlyStop"],
+): HamiltonConfig => ({
+  watchCommands: ["git"],
+  zoneViolation: "record",
+  earlyStop,
+  eventRetry: { maxAttempts: 3, baseDelayMs: 1000, maxDelayMs: 30000 },
+  leaseTtlMs: 60000,
+})
+
+const telemetry = (
+  tool: string,
+  input?: Record<string, unknown>,
+  opencodeType = "session.next.tool.called",
+): unknown => ({
+  opencodeType,
+  properties: { tool, ...(input !== undefined ? { input } : {}) },
+})
+
+describe("task.dispatched zones", () => {
+  test("stores zone, branch and role from the payload", () => {
+    const next = applyEvent(
+      empty,
+      evt("task.dispatched", {
+        taskId: "t1",
+        payload: {
+          role: "implementer",
+          branch: "feat/x",
+          zone: ["packages/core/src"],
+        },
+      }),
+    )
+    expect(next.tasks["t1"]?.zone).toEqual(["packages/core/src"])
+    expect(next.tasks["t1"]?.branch).toBe("feat/x")
+    expect(next.tasks["t1"]?.role).toBe("implementer")
+  })
+
+  test("defaults zone to [] when the payload has none", () => {
+    const next = applyEvent(
+      empty,
+      evt("task.dispatched", { taskId: "t1", payload: { role: "planner" } }),
+    )
+    expect(next.tasks["t1"]?.zone).toEqual([])
+  })
+})
+
+describe("extractBashCommand", () => {
+  test("detects a watched git command", () => {
+    expect(
+      extractBashCommand(telemetry("bash", { command: "git commit -m hi" }), [
+        "git",
+      ]),
+    ).toEqual({ command: "git commit -m hi", matched: "git" })
+  })
+
+  test("returns null for non-bash tools", () => {
+    expect(
+      extractBashCommand(telemetry("edit", { filePath: "a.ts" }), ["git"]),
+    ).toBeNull()
+  })
+
+  test("returns null for bash without a command", () => {
+    expect(
+      extractBashCommand(telemetry("bash", { timeout: 30 }), ["git"]),
+    ).toBeNull()
+    expect(extractBashCommand(telemetry("bash"), ["git"])).toBeNull()
+  })
+
+  test("reports an unmatched command with matched null", () => {
+    expect(
+      extractBashCommand(telemetry("bash", { command: "npm test" }), ["git"]),
+    ).toEqual({ command: "npm test", matched: null })
+  })
+})
+
+describe("findZoneViolation", () => {
+  test("returns null for in-zone paths", () => {
+    expect(
+      findZoneViolation(
+        telemetry("edit", { filePath: "packages/core/src/a.ts" }),
+        ["packages/core/src"],
+      ),
+    ).toBeNull()
+  })
+
+  test("returns the path for out-of-zone edits", () => {
+    expect(
+      findZoneViolation(telemetry("write", { filePath: "lib/b.ts" }), [
+        "packages/core/src",
+      ]),
+    ).toBe("lib/b.ts")
+  })
+
+  test("returns null when the zone is empty", () => {
+    expect(
+      findZoneViolation(telemetry("edit", { filePath: "lib/b.ts" }), []),
+    ).toBeNull()
+  })
+
+  test("returns null for non-edit/write tools", () => {
+    expect(
+      findZoneViolation(telemetry("bash", { filePath: "x.ts" }), [
+        "packages/core/src",
+      ]),
+    ).toBeNull()
+  })
+})
+
+describe("recordCommand / recordViolation", () => {
+  const start: RunSnapshot = {
+    tasks: {
+      t1: { id: "t1", status: "in-progress" as TaskStatus, role: "", zone: [] },
+    },
+    agents: {
+      a1: agentState("a1", "working", { taskId: "t1" }),
+    },
+    phase: "running",
+  }
+
+  test("recordCommand sets lastCommand and tags the task", () => {
+    const next = recordCommand(start, "a1", "git commit -m x", "git")
+    expect(next.agents["a1"]?.lastCommand).toBe("git commit -m x")
+    expect(next.tasks["t1"]?.lastEventType).toBe("agent.command")
+  })
+
+  test("recordCommand upserts an unknown agent without tagging a task", () => {
+    const next = recordCommand(start, "ghost", "git status", "git")
+    expect(next.agents["ghost"]?.lastCommand).toBe("git status")
+    expect(next.agents["ghost"]?.failures).toBe(0)
+    expect(next.tasks["t1"]?.lastEventType).toBeUndefined()
+  })
+
+  test("recordViolation increments zoneViolations", () => {
+    const once = recordViolation(start, "a1", "lib/b.ts")
+    expect(once.agents["a1"]?.zoneViolations).toBe(1)
+    const twice = recordViolation(once, "a1", "lib/c.ts")
+    expect(twice.agents["a1"]?.zoneViolations).toBe(2)
+  })
+
+  test("recordViolation upserts an unknown agent", () => {
+    const next = recordViolation(start, "ghost", "lib/b.ts")
+    expect(next.agents["ghost"]?.zoneViolations).toBe(1)
+  })
+})
+
+describe("shouldStop", () => {
+  test("false below both thresholds", () => {
+    const snapshot = {
+      ...empty,
+      agents: {
+        a1: agentState("a1", "died"),
+        a2: agentState("a2", "working"),
+        a3: agentState("a3", "working"),
+      },
+    }
+    expect(
+      shouldStop(
+        snapshot,
+        testConfig({ enabled: true, maxFailedAgents: 3, failedRatio: 0.5 }),
+      ),
+    ).toBe(false)
+  })
+
+  test("true at maxFailedAgents", () => {
+    const snapshot = {
+      ...empty,
+      agents: {
+        a1: agentState("a1", "died"),
+        a2: agentState("a2", "error"),
+        a3: agentState("a3", "working"),
+      },
+    }
+    expect(
+      shouldStop(
+        snapshot,
+        testConfig({ enabled: true, maxFailedAgents: 2, failedRatio: 0.9 }),
+      ),
+    ).toBe(true)
+  })
+
+  test("true at the failed ratio", () => {
+    const snapshot = {
+      ...empty,
+      agents: {
+        a1: agentState("a1", "died"),
+        a2: agentState("a2", "working"),
+      },
+    }
+    expect(
+      shouldStop(
+        snapshot,
+        testConfig({ enabled: true, maxFailedAgents: 3, failedRatio: 0.5 }),
+      ),
+    ).toBe(true)
+  })
+
+  test("false when early stop is disabled", () => {
+    const snapshot = {
+      ...empty,
+      agents: { a1: agentState("a1", "died") },
+    }
+    expect(
+      shouldStop(
+        snapshot,
+        testConfig({ enabled: false, maxFailedAgents: 1, failedRatio: 0.1 }),
+      ),
+    ).toBe(false)
+  })
+
+  test("false for an empty run", () => {
+    expect(
+      shouldStop(
+        empty,
+        testConfig({ enabled: true, maxFailedAgents: 1, failedRatio: 0.1 }),
+      ),
+    ).toBe(false)
+  })
+})
+
+describe("early stop transitions", () => {
+  const cfg = testConfig({
+    enabled: true,
+    maxFailedAgents: 1,
+    failedRatio: 0.5,
+  })
+
+  test("agent.error bumps failures and sets phase stopping", () => {
+    const start = {
+      ...empty,
+      agents: { a1: agentState("a1", "working") },
+    }
+    const next = applyEvent(start, evt("agent.error", { agentId: "a1" }), cfg)
+    expect(next.agents["a1"]?.state).toBe("error")
+    expect(next.agents["a1"]?.failures).toBe(1)
+    expect(next.phase).toBe("stopping")
+  })
+
+  test("agent.died bumps failures and sets phase stopping", () => {
+    const start = {
+      ...empty,
+      agents: { a1: agentState("a1", "working") },
+    }
+    const next = applyEvent(start, evt("agent.died", { agentId: "a1" }), cfg)
+    expect(next.agents["a1"]?.state).toBe("died")
+    expect(next.agents["a1"]?.failures).toBe(1)
+    expect(next.phase).toBe("stopping")
+  })
+
+  test("no stopping without a config", () => {
+    const start = {
+      ...empty,
+      agents: { a1: agentState("a1", "working") },
+    }
+    expect(applyEvent(start, evt("agent.error", { agentId: "a1" })).phase).toBe(
+      "planned",
+    )
+  })
+
+  test("agent.claimed does not start planned tasks while stopping", () => {
+    const start = {
+      tasks: {
+        t1: {
+          id: "t1",
+          status: "planned" as TaskStatus,
+          role: "implementer",
+          zone: [],
+        },
+      },
+      agents: { a1: agentState("a1", "died", { failures: 1 }) },
+      phase: "stopping",
+    }
+    const next = applyEvent(
+      start,
+      evt("agent.claimed", { taskId: "t1", agentId: "a2" }),
+    )
+    expect(next.tasks["t1"]?.status).toBe("planned")
+    expect(next.agents["a2"]?.state).toBe("claimed")
+  })
+
+  test("milestones still record while stopping", () => {
+    const start = {
+      tasks: {
+        t1: {
+          id: "t1",
+          status: "in-progress" as TaskStatus,
+          role: "",
+          zone: [],
+        },
+      },
+      agents: { a1: agentState("a1", "started", { taskId: "t1" }) },
+      phase: "stopping",
+    }
+    const next = applyEvent(start, evt("agent.milestone", { agentId: "a1" }))
+    expect(next.agents["a1"]?.milestoneCount).toBe(1)
+    expect(next.tasks["t1"]?.lastEventType).toBe("agent.milestone")
+  })
+})
+
+describe("supervision state", () => {
+  test("agent.milestone increments milestoneCount and moves started agents to working", () => {
+    const start = { ...empty, agents: { a1: agentState("a1", "started") } }
+    const first = applyEvent(start, evt("agent.milestone", { agentId: "a1" }))
+    expect(first.agents["a1"]?.milestoneCount).toBe(1)
+    expect(first.agents["a1"]?.state).toBe("working")
+    const second = applyEvent(first, evt("agent.milestone", { agentId: "a1" }))
+    expect(second.agents["a1"]?.milestoneCount).toBe(2)
+    expect(second.agents["a1"]?.state).toBe("working")
+  })
+
+  test("agent.command records lastCommand defensively", () => {
+    const start = { ...empty, agents: { a1: agentState("a1", "working") } }
+    const next = applyEvent(
+      start,
+      evt("agent.command", {
+        agentId: "a1",
+        payload: { command: "git push", matched: "git" },
+      }),
+    )
+    expect(next.agents["a1"]?.lastCommand).toBe("git push")
+  })
+
+  test("agent.zone_violation increments zoneViolations defensively", () => {
+    const start = {
+      ...empty,
+      agents: { a1: agentState("a1", "working", { zoneViolations: 1 }) },
+    }
+    const next = applyEvent(
+      start,
+      evt("agent.zone_violation", {
+        agentId: "a1",
+        payload: { path: "lib/b.ts" },
+      }),
+    )
+    expect(next.agents["a1"]?.zoneViolations).toBe(2)
+  })
+})
+
+describe("agentLogKey", () => {
+  test("pads seq and embeds the event id", () => {
+    expect(agentLogKey("run-1", "a1", "milestones", 42, "evt-42")).toBe(
+      "artifacts/run-1/agent-a1/milestones/0000000042-evt-42.json",
+    )
+    expect(agentLogKey("run-1", "a2", "reports", 7)).toMatch(
+      /^artifacts\/run-1\/agent-a2\/reports\/0000000007-\d+\.json$/,
+    )
   })
 })

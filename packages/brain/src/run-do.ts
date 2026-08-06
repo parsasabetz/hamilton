@@ -5,13 +5,23 @@
 //     state:${runId}:run               — run snapshot { runId, phase, seq, updatedAt, tasks[], agents[] }
 //     state:${runId}:agent:${agentId}  — agent snapshot, written by AgentDO on liveness expiry
 //     dedupe:${eventId}                — event dedupe marker (expirationTtl 86400)
+//     lease:${eventId}                 — queue delivery lease (double-delivery guard)
+//     dead:${eventId}                  — give-up record after queue retries are exhausted
+//   ARTIFACTS:
+//     artifacts:${runId}/agent-${agentId}/${kind}/${seq}-${eventId}.json — per-agent append logs
 //   EVENTS (owned by the Core bus, NOT by brain — do not touch):
 //     evt:${runId}:${seq}              — event log
 //     seq:${runId}:counter             — next sequence number
 
-import type { HamiltonEvent, Task, TaskStatus } from "@hamilton/shared"
+import type {
+  HamiltonConfig,
+  HamiltonEvent,
+  Task,
+  TaskStatus,
+} from "@hamilton/shared"
 import { DurableObject } from "cloudflare:workers"
 
+import { parseConfig } from "./index.ts"
 import type { Env } from "./index.ts"
 
 const KEYS = {
@@ -30,6 +40,7 @@ export interface TaskRunState {
   status: TaskStatus
   role: string
   branch?: string
+  zone: string[]
   lastEventType?: string
   lastEventAt?: string
 }
@@ -43,6 +54,10 @@ export interface AgentRunState {
   busy?: boolean
   stalledAt?: string
   diedAt?: string
+  failures: number
+  lastCommand?: string
+  zoneViolations: number
+  milestoneCount: number
 }
 
 export interface RunSnapshot {
@@ -111,6 +126,97 @@ function stringArray(value: unknown): string[] | undefined {
     if (typeof item !== "string") return undefined
   }
   return value
+}
+
+// Telemetry-derived supervision — pure extracts over a telemetry.opencode
+// payload ({ eventId?, opencodeType, sessionId?, properties }), so the RunDO
+// wiring stays thin and the logic is unit-testable.
+
+export function extractBashCommand(
+  payload: unknown,
+  watchCommands: readonly string[],
+): { command: string; matched: string | null } | null {
+  const record = payloadRecord(payload)
+  if (record.opencodeType !== "session.next.tool.called") return null
+  const properties = record.properties
+  if (typeof properties !== "object" || properties === null) return null
+  const props = properties as Record<string, unknown>
+  if (props.tool !== "bash") return null
+  const input = props.input
+  if (typeof input !== "object" || input === null) return null
+  const command = (input as Record<string, unknown>).command
+  if (typeof command !== "string" || command.length === 0) return null
+  const matched = watchCommands.find((prefix) => command.startsWith(prefix))
+  return { command, matched: matched ?? null }
+}
+
+export function findZoneViolation(
+  payload: unknown,
+  zone: readonly string[],
+): string | null {
+  const record = payloadRecord(payload)
+  if (record.opencodeType !== "session.next.tool.called") return null
+  const properties = record.properties
+  if (typeof properties !== "object" || properties === null) return null
+  const props = properties as Record<string, unknown>
+  if (props.tool !== "edit" && props.tool !== "write") return null
+  const input = props.input
+  if (typeof input !== "object" || input === null) return null
+  const filePath = (input as Record<string, unknown>).filePath
+  if (typeof filePath !== "string" || filePath.length === 0) return null
+  if (zone.length === 0) return null
+  if (zone.some((prefix) => filePath.startsWith(prefix))) return null
+  return filePath
+}
+
+export function recordCommand(
+  snapshot: RunSnapshot,
+  agentId: string,
+  command: string,
+  matched: string | null,
+): RunSnapshot {
+  let next = patchAgent(snapshot, agentId, { lastCommand: command })
+  if (matched !== null) {
+    const taskId = next.agents[agentId]?.taskId
+    if (taskId !== undefined && next.tasks[taskId] !== undefined) {
+      next = patchTask(next, taskId, { lastEventType: "agent.command" })
+    }
+  }
+  return next
+}
+
+export function recordViolation(
+  snapshot: RunSnapshot,
+  agentId: string,
+  _path: string,
+): RunSnapshot {
+  const zoneViolations = (snapshot.agents[agentId]?.zoneViolations ?? 0) + 1
+  return patchAgent(snapshot, agentId, { zoneViolations })
+}
+
+export function shouldStop(
+  snapshot: RunSnapshot,
+  config: HamiltonConfig,
+): boolean {
+  if (!config.earlyStop.enabled) return false
+  const agents = Object.values(snapshot.agents)
+  const known = agents.length
+  const failed = agents.filter(
+    (agent) => agent.state === "died" || agent.state === "error",
+  ).length
+  if (failed >= config.earlyStop.maxFailedAgents) return true
+  return known > 0 && failed / known >= config.earlyStop.failedRatio
+}
+
+export function agentLogKey(
+  runId: string,
+  agentId: string,
+  kind: string,
+  seq: number,
+  suffix?: string,
+): string {
+  const padded = String(seq).padStart(10, "0")
+  return `artifacts/${runId}/agent-${agentId}/${kind}/${padded}-${suffix ?? Date.now()}.json`
 }
 
 // Best-effort parse of a full Task (from task.dispatched payload) for the `graph`
@@ -192,6 +298,9 @@ function patchAgent(
   const agent: AgentRunState = existing ?? {
     agentId,
     state: "working",
+    failures: 0,
+    zoneViolations: 0,
+    milestoneCount: 0,
     ...(patch.taskId !== undefined ? { taskId: patch.taskId } : {}),
   }
   return setAgent(snapshot, { ...agent, ...patch })
@@ -204,7 +313,7 @@ function withTaskStatus(
 ): RunSnapshot {
   const existing = snapshot.tasks[taskId]
   if (existing === undefined) {
-    return setTask(snapshot, { id: taskId, status, role: "" })
+    return setTask(snapshot, { id: taskId, status, role: "", zone: [] })
   }
   if (existing.status === status) return snapshot
   return patchTask(snapshot, taskId, { status })
@@ -216,6 +325,7 @@ function withTaskStatus(
 export function applyEvent(
   snapshot: RunSnapshot,
   evt: HamiltonEvent,
+  config?: HamiltonConfig,
 ): RunSnapshot {
   const payload = payloadRecord(evt.payload)
   switch (evt.type) {
@@ -231,7 +341,16 @@ export function applyEvent(
       const taskId = evt.taskId
       if (taskId === undefined) return snapshot
       const role = typeof payload.role === "string" ? payload.role : ""
-      return setTask(snapshot, { id: taskId, status: "in-progress", role })
+      const branch =
+        typeof payload.branch === "string" ? payload.branch : undefined
+      const zone = stringArray(payload.zone) ?? []
+      return setTask(snapshot, {
+        id: taskId,
+        status: "in-progress",
+        role,
+        branch,
+        zone,
+      })
     }
     case "task.status_changed": {
       const taskId = evt.taskId
@@ -259,11 +378,16 @@ export function applyEvent(
       const agent: AgentRunState = {
         agentId,
         state: evt.type === "agent.started" ? "started" : "claimed",
+        failures: 0,
+        zoneViolations: 0,
+        milestoneCount: 0,
         ...(evt.taskId !== undefined ? { taskId: evt.taskId } : {}),
       }
       let next = setAgent(snapshot, agent)
       const taskId = evt.taskId
-      if (taskId !== undefined) {
+      // While stopping, dispatch is halted: claimed/started register the agent
+      // but must not promote planned tasks (healthy agents still finish).
+      if (taskId !== undefined && snapshot.phase !== "stopping") {
         const task = snapshot.tasks[taskId]
         if (task !== undefined && task.status === "planned") {
           next = withTaskStatus(next, taskId, "in-progress")
@@ -284,10 +408,17 @@ export function applyEvent(
             })
           : snapshot
       if (agentId !== undefined) {
-        next = patchAgent(next, agentId, {
+        const current = snapshot.agents[agentId]
+        const working =
+          current !== undefined &&
+          (current.state === "claimed" || current.state === "started")
+        const patch: Partial<AgentRunState> = {
           lastActivityAt: evt.ts,
+          milestoneCount: (current?.milestoneCount ?? 0) + 1,
           ...(taskId !== undefined ? { taskId } : {}),
-        })
+        }
+        if (working) patch.state = "working"
+        next = patchAgent(next, agentId, patch)
       }
       return next
     }
@@ -321,19 +452,43 @@ export function applyEvent(
       const agentId = evt.agentId
       return agentId === undefined
         ? snapshot
-        : patchAgent(snapshot, agentId, { busy: false })
+        : patchAgent(snapshot, agentId, { state: "idle", busy: false })
     }
     case "agent.died": {
       const agentId = evt.agentId
-      return agentId === undefined
-        ? snapshot
-        : patchAgent(snapshot, agentId, { diedAt: evt.ts })
+      if (agentId === undefined) return snapshot
+      const failures = (snapshot.agents[agentId]?.failures ?? 0) + 1
+      let next = patchAgent(snapshot, agentId, {
+        state: "died",
+        diedAt: evt.ts,
+        failures,
+      })
+      if (config !== undefined && shouldStop(next, config)) {
+        next = { ...next, phase: "stopping" }
+      }
+      return next
     }
     case "agent.error": {
       const agentId = evt.agentId
-      return agentId === undefined
-        ? snapshot
-        : patchAgent(snapshot, agentId, { state: "error" })
+      if (agentId === undefined) return snapshot
+      const failures = (snapshot.agents[agentId]?.failures ?? 0) + 1
+      let next = patchAgent(snapshot, agentId, { state: "error", failures })
+      if (config !== undefined && shouldStop(next, config)) {
+        next = { ...next, phase: "stopping" }
+      }
+      return next
+    }
+    case "agent.command": {
+      const agentId = evt.agentId
+      const command = payload.command
+      if (agentId === undefined || typeof command !== "string") return snapshot
+      return patchAgent(snapshot, agentId, { lastCommand: command })
+    }
+    case "agent.zone_violation": {
+      const agentId = evt.agentId
+      if (agentId === undefined) return snapshot
+      const zoneViolations = (snapshot.agents[agentId]?.zoneViolations ?? 0) + 1
+      return patchAgent(snapshot, agentId, { zoneViolations })
     }
     case "review.assigned":
     case "review.started": {
@@ -461,6 +616,61 @@ export class RunDO extends DurableObject<Env> {
     return name === undefined ? "default" : name.slice(name.indexOf(":") + 1)
   }
 
+  private configValue: HamiltonConfig | undefined
+  private get config(): HamiltonConfig {
+    if (this.configValue === undefined) {
+      this.configValue = parseConfig(this.env.CONFIG)
+    }
+    return this.configValue
+  }
+
+  // Telemetry-derived supervision: inspect telemetry.opencode events BEFORE
+  // applyEvent so the recorded command/violation state lands in the snapshot
+  // that gets persisted with this event.
+  private supervise(evt: HamiltonEvent, snapshot: RunSnapshot): RunSnapshot {
+    if (evt.type !== "telemetry.opencode") return snapshot
+    const payload = payloadRecord(evt.payload)
+    const sessionId =
+      typeof payload.sessionId === "string" ? payload.sessionId : undefined
+    const agentId = sessionId ?? evt.agentId
+    if (agentId === undefined) return snapshot
+    const taskId = snapshot.agents[agentId]?.taskId
+    const zone = taskId !== undefined ? snapshot.tasks[taskId]?.zone : undefined
+    let next = snapshot
+    const extracted = extractBashCommand(evt.payload, this.config.watchCommands)
+    if (extracted !== null && extracted.matched !== null) {
+      next = recordCommand(next, agentId, extracted.command, extracted.matched)
+      this.logArtifact(evt, agentId, "commands")
+    }
+    const violation = findZoneViolation(evt.payload, zone ?? [])
+    if (violation !== null) {
+      next = recordViolation(next, agentId, violation)
+      this.logArtifact(evt, agentId, "violations")
+    }
+    return next
+  }
+
+  private logAgentArtifacts(evt: HamiltonEvent): void {
+    const agentId = evt.agentId
+    if (agentId === undefined) return
+    if (evt.type === "agent.milestone") {
+      this.logArtifact(evt, agentId, "milestones")
+    } else if (
+      evt.type === "agent.ready_for_review" ||
+      evt.type === "agent.subagent_result"
+    ) {
+      this.logArtifact(evt, agentId, "reports")
+    }
+  }
+
+  // Append-only per-agent log. Fire-and-forget with a swallow catch: a failed
+  // artifact write must never fail event processing.
+  private logArtifact(evt: HamiltonEvent, agentId: string, kind: string): void {
+    const key = agentLogKey(evt.runId, agentId, kind, evt.seq, evt.id)
+    const body = { ...payloadRecord(evt.payload), ts: evt.ts, seq: evt.seq }
+    void this.env.ARTIFACTS.put(key, JSON.stringify(body)).catch(() => {})
+  }
+
   private async handleEvent(evt: HamiltonEvent): Promise<Response> {
     const lastSeq = (await this.ctx.storage.get<number>(KEYS.lastSeq)) ?? 0
     if (evt.seq <= lastSeq) {
@@ -485,7 +695,9 @@ export class RunDO extends DurableObject<Env> {
       agents: agents ?? {},
       phase: phase ?? "planned",
     }
-    const next = applyEvent(snapshot, evt)
+    const supervised = this.supervise(evt, snapshot)
+    const next = applyEvent(supervised, evt, this.config)
+    this.logAgentArtifacts(evt)
     let nextGraph = graph ?? []
     if (evt.type === "task.dispatched") {
       const parsed =
