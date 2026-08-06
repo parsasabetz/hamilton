@@ -34,6 +34,10 @@ export const hamiltonEventTypes = [
   // agent domain — derived supervision (from tool-call telemetry)
   "agent.command",
   "agent.zone_violation",
+  // worktree domain — conductor-owned git status (worktree watcher)
+  "worktree.created",
+  "worktree.status_changed",
+  "worktree.removed",
   // review domain
   "review.assigned",
   "review.started",
@@ -101,6 +105,61 @@ export const taskSchema = z.object({
 
 export type Task = z.infer<typeof taskSchema>
 
+// HAMILTON.md §9 — the task graph (a run's full plan).
+
+export const taskGraphSchema = z.object({
+  tasks: z.array(taskSchema).min(1),
+  meta: z
+    .object({
+      prompt: z.string().optional(),
+      created_at: z.string().optional(),
+    })
+    .optional(),
+})
+
+export type TaskGraph = z.infer<typeof taskGraphSchema>
+
+// HAMILTON.md §"Dispatch loop" — the RunDO → Core action protocol (carried
+// over the miniflare CORE service binding; plain JSON, no zod in the bundle).
+
+export type CoreAction =
+  | {
+      action: "worktree.ensure"
+      runId: string
+      taskId: string
+      parent: string
+      branch: string
+    }
+  | {
+      action: "session.start"
+      runId: string
+      taskId: string
+      agent: string
+      model: string
+      brief: string
+    }
+  | {
+      action: "session.abort"
+      runId: string
+      taskId: string
+    }
+  | {
+      action: "merge.execute"
+      runId: string
+      taskId: string
+      branch: string
+      parent: string
+    }
+
+export type CoreActionResult =
+  | {
+      ok: true
+      worktreePath?: string
+      sessionId?: string
+      mergeCommit?: string
+    }
+  | { ok: false; error: string }
+
 // HAMILTON.md §"Runtime config" — the constants layer's runtime configuration.
 // Validated once in the Core; the brain receives it as a JSON binding.
 
@@ -128,6 +187,26 @@ export const hamiltonConfigSchema = z.object({
     .default({ maxAttempts: 3, baseDelayMs: 1000, maxDelayMs: 30_000 }),
   /** Lease TTL for in-flight event processing (double-delivery guard). */
   leaseTtlMs: z.number().int().positive().default(60_000),
+  /** Worktree provisioning (M2): relative dir for task worktrees + installs. */
+  worktreesDir: z.string().default(".worktrees"),
+  provision: z
+    .object({
+      /** "auto" installs in new worktrees when a lockfile exists; "skip" never. */
+      install: z.enum(["auto", "skip"]),
+    })
+    .default({ install: "auto" }),
+  /** Composite activity window (M2): an agent is "active" when any signal —
+   *  git changes, commits, OpenCode tool calls, telemetry — arrived within
+   *  windowMs. Silence past the window = idle; past the bridge stall timeout
+   *  = stalled. */
+  activity: z
+    .object({
+      windowMs: z.number().int().positive(),
+    })
+    .default({ windowMs: 120_000 }),
+  /** Merge authority: "autonomous" executes merges on ready_for_review;
+   *  "owner-gated" waits for the owner (D2 default; M2 demo passes autonomous). */
+  mergeAuthority: z.enum(["autonomous", "owner-gated"]).default("owner-gated"),
 })
 
 export type HamiltonConfig = z.infer<typeof hamiltonConfigSchema>

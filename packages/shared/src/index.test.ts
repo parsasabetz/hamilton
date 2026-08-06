@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { hamiltonConfigSchema, taskSchema } from "./index.ts"
+import { hamiltonConfigSchema, taskGraphSchema, taskSchema } from "./index.ts"
 
 const validTask = {
   id: "t1",
@@ -92,5 +92,59 @@ describe("hamiltonConfigSchema", () => {
         earlyStop: { enabled: true, maxFailedAgents: 2, failedRatio: 1.5 },
       }).success,
     ).toBe(false)
+  })
+})
+
+describe("taskGraphSchema", () => {
+  const validTask = {
+    id: "t1",
+    role: "implementer",
+    zone: ["packages/core/src"],
+    depends_on: [],
+    status: "planned",
+    on_failure: "retry-once",
+    contract: { inputs: ["doc §1"], outputs: ["feature"] },
+    model: "opencode-go/deepseek-v4-flash",
+  }
+
+  test("accepts a graph with one or more tasks", () => {
+    expect(taskGraphSchema.safeParse({ tasks: [validTask] }).success).toBe(true)
+    expect(
+      taskGraphSchema.safeParse({
+        tasks: [validTask, { ...validTask, id: "t2", depends_on: ["t1"] }],
+        meta: { prompt: "build an app" },
+      }).success,
+    ).toBe(true)
+  })
+
+  test("rejects an empty or invalid graph", () => {
+    expect(taskGraphSchema.safeParse({ tasks: [] }).success).toBe(false)
+    expect(
+      taskGraphSchema.safeParse({ tasks: [{ ...validTask, depends_on: "t2" }] })
+        .success,
+    ).toBe(false)
+  })
+})
+
+describe("hamiltonConfigSchema M2 additions", () => {
+  test("defaults for worktrees, provision, activity, mergeAuthority", () => {
+    const cfg = hamiltonConfigSchema.parse({})
+    expect(cfg.worktreesDir).toBe(".worktrees")
+    expect(cfg.provision).toEqual({ install: "auto" })
+    expect(cfg.activity).toEqual({ windowMs: 120_000 })
+    expect(cfg.mergeAuthority).toBe("owner-gated")
+  })
+
+  test("accepts M2 overrides", () => {
+    const cfg = hamiltonConfigSchema.parse({
+      worktreesDir: "../wt",
+      provision: { install: "skip" },
+      activity: { windowMs: 60_000 },
+      mergeAuthority: "autonomous",
+    })
+    expect(cfg.worktreesDir).toBe("../wt")
+    expect(cfg.provision.install).toBe("skip")
+    expect(cfg.activity.windowMs).toBe(60_000)
+    expect(cfg.mergeAuthority).toBe("autonomous")
   })
 })
