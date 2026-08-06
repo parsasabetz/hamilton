@@ -101,7 +101,7 @@ Three planes, one contract — the event bus.
 ### 4.1 Rules
 
 1. Events are the only language between planes. No file polling, no shared mutable files.
-2. The event log is append-only and ordered per run (`seq` assigned by RunDO).
+2. The event log is append-only and ordered per run (`seq` assigned by the Core bus, zero-padded KV keys preserve order; RunDO dedupes by event id and rejects stale seqs).
 3. State, dashboard, and yaml mirrors are projections; they are recomputed, never hand-written.
 4. At-least-once delivery: consumers must be idempotent by event `id`.
 
@@ -115,7 +115,7 @@ interface HamiltonEvent {
   runId: string
   taskId?: string
   agentId?: string // opencode session id
-  seq: number // per-run monotonic, assigned by RunDO
+  seq: number // per-run monotonic, assigned by the Core bus
   payload: unknown
 }
 ```

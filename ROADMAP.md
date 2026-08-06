@@ -8,31 +8,26 @@
 
 ## Status summary
 
-| Area                                                                 | Completion | Notes                                                                                            |
-| -------------------------------------------------------------------- | ---------- | ------------------------------------------------------------------------------------------------ |
-| Toolchain (pnpm/turbo/bun/ts7/oxc/changesets/logtape/citty/husky/CI) | **100%**   | gate green, hooks active, CI covers main+dev                                                     |
-| Design doc (`HAMILTON.md`)                                           | **100%**   | all contracts specified                                                                          |
-| Contracts (`@hamilton/shared`)                                       | **100%**   | event envelope + full type table, zod task schema, MCP tool specs                                |
-| OpenCode bridge (`core/src/bridge.ts`)                               | **~90%**   | subscribe/classify/track/stall/idle/stream events, tested — only the bus wiring is missing       |
-| MCP server (`@hamilton/mcp`)                                         | **~70%**   | stdio server + all 6 tools registered and smoke-tested; handlers acknowledge instead of emitting |
-| Core server                                                          | **~30%**   | health, SSE ping, status-page stub — no `/api/state`, no bus fan-out, no control-plane calls     |
-| Brain (Miniflare DOs)                                                | **~15%**   | RunDO skeleton with alarm pattern; miniflare-under-Bun proven (KV/R2/DO/alarm smoke passed)      |
-| Planner / dispatch / gate / merge / recovery                         | **0%**     | not started                                                                                      |
-| Status page                                                          | **~10%**   | stub page only                                                                                   |
+| Area                                                                 | Completion | Notes                                                                                                                               |
+| -------------------------------------------------------------------- | ---------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| Toolchain (pnpm/turbo/bun/ts7/oxc/changesets/logtape/citty/husky/CI) | **100%**   | gate green, hooks active, CI covers main+dev                                                                                        |
+| Design doc (`HAMILTON.md`)                                           | **100%**   | all contracts specified                                                                                                             |
+| Contracts (`@hamilton/shared`)                                       | **100%**   | event envelope + full type table (runtime array), zod task schema, MCP tool specs                                                   |
+| OpenCode bridge (`core/src/bridge.ts`)                               | **100%**   | emits into the bus via `startCore` when `HAMILTON_OPCODE_URL` is set                                                                |
+| MCP server (`@hamilton/mcp`)                                         | **100%**   | all 6 tools emit onto the bus via the HTTP shim; checkpoint `phase` selects the event type                                          |
+| Core server                                                          | **~70%**   | event bus (seq/KV/queue/fan-out), `/api/events`, `/api/state`, SSE `/api/stream`, status page                                       |
+| Brain (Miniflare DOs)                                                | **~70%**   | RunDO (dedupe, transitions, snapshots, diff-forwarding), TaskDO/AgentDO/ReviewDO, queue consumer; AgentDO liveness alarms next (M4) |
+| Planner / dispatch / gate / merge / recovery                         | **0%**     | not started                                                                                                                         |
+| Status page                                                          | **~60%**   | header/task table/agent table/event tail, SSE live — DAG diagram + detail panels in M2/M5                                           |
+| M1 demo (`core/src/demo.ts`)                                         | **done**   | agent → MCP → bus → queue → RunDO → KV → page, incl. restart persistence                                                            |
 
 ## Remaining work by milestone
 
-### M1 — Event spine (the bus) · _next_
+### M1 — Event spine (the bus) · **complete**
 
-| Task                                                                                                | Status      |
-| --------------------------------------------------------------------------------------------------- | ----------- |
-| MCP tool handlers → Core shim (HTTP) → queue → RunDO consumer                                       | not started |
-| Miniflare wiring in Core: KV (event log, registries), R2 (artifacts), queue (bus), DO storage       | not started |
-| RunDO event handling: dedupe by id, state transitions, seq assignment                               | not started |
-| TaskDO / AgentDO / ReviewDO state machines + alarms (claim deadline, heartbeat expiry)              | not started |
-| Bridge emits onto the bus instead of a callback                                                     | not started |
-| `/api/state` projection + SSE fan-out of bus events (page skeleton: header, task table, event tail) | not started |
-| One demo task end-to-end: claim → milestones → ready, visible live on the page                      | not started |
+All M1 tasks shipped (queue → RunDO consumer, Miniflare wiring, RunDO/TaskDO/AgentDO/ReviewDO,
+bridge → bus, `/api/state` + SSE + page, end-to-end demo with resumption).
+AgentDO heartbeat-expiry/claim-deadline alarms remain pending until M4 (state machines exist).
 
 **Exit:** a single demo task runs agent → MCP → bus → RunDO → KV/R2 → page.
 
@@ -96,13 +91,14 @@ miniflare queue dispatch + stdio→HTTP shim are first-time integrations).
 
 ## Where Level 1 is reached
 
-`M1 + M2 + M3 + M4` — i.e. everything except the M5 polish layer.
-**Rough total: ~8–11 focused sessions** to the "one prompt → finished app, zero
-intervention" goal, dominated by M2. M5 can follow or ship incrementally.
+`M1 + M2 + M3 + M4` — M1 is complete; **~7–9 focused sessions remain**
+(M2 the largest at ~3–4, then M3 ~2, M4 ~2), to the "one prompt → finished
+app, zero intervention" goal. M5 can follow or ship incrementally.
 
 ## Known risks (in build order)
 
-1. **M1 integration unknowns** — miniflare queue-producer/consumer option details under Bun, and the MCP stdio → Core shim transport. Both are isolated in M1's demo task.
+1. ~~M1 integration unknowns — miniflare queue dispatch + the MCP stdio → Core shim transport.~~ **Resolved:** queue producer → consumer verified end-to-end; demo passes.
 2. **OpenCode permission flow in headless mode** — the auto-responder must observe `permission.required` events correctly; verify early in M2 with a real `opencode serve`.
 3. **Planner determinism** — the first graph must be trivially correct for a small app before it generalizes; the zod validation + loud failure path is the safety net.
 4. **Git worktree provisioning speed** — installs per worktree are expensive; batch/symlink strategies are a later optimization, not a blocker.
+5. **Miniflare needs bundling** — workerd cannot parse TS: the brain worker is esbuild-bundled (with `cloudflare:*` external) into `packages/core/dist/brain.js` at boot; bundles and persist dirs must live inside the repo (workerd sandbox).
