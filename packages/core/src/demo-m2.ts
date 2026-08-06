@@ -112,6 +112,7 @@ const REVIEW_ROLES = ["correctness", "standards"]
 
 async function fakeReviewers(taskId: string): Promise<void> {
   for (let idx = 0; idx < REVIEW_ROLES.length; idx += 1) {
+    // oxlint-disable-next-line no-await-in-loop -- staged submissions, sequential by design
     await fetch(`http://localhost:${PORT}/api/events`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -133,6 +134,7 @@ async function fakeReviewers(taskId: string): Promise<void> {
         },
       }),
     })
+    // oxlint-disable-next-line no-await-in-loop -- staged submissions, sequential by design
     await Bun.sleep(120)
   }
   console.log(`  fake reviewers ${taskId}: pass`)

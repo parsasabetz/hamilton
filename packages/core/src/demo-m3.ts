@@ -78,6 +78,7 @@ async function submitReviews(
   correctnessVerdict: "pass" | "fail",
 ): Promise<void> {
   for (let idx = 0; idx < REVIEW_ROLES.length; idx += 1) {
+    // oxlint-disable-next-line no-await-in-loop -- staged submissions, sequential by design
     await postEvent("review.submitted", taskId, `review-${taskId}-${idx}`, {
       reviewer: REVIEW_ROLES[idx]!,
       idx,
@@ -99,6 +100,7 @@ async function submitReviews(
       ],
       summary: `${taskId} ${correctnessVerdict} (demo)`,
     })
+    // oxlint-disable-next-line no-await-in-loop -- staged submissions, sequential by design
     await Bun.sleep(120)
   }
 }
@@ -230,6 +232,7 @@ async function main(): Promise<void> {
 
   const driver = async (): Promise<void> => {
     while (true) {
+      // oxlint-disable-next-line no-await-in-loop -- deliberate poll loop
       const snapshot = await fetchSnapshot()
       const tasks = snapshot.tasks ?? []
       for (const task of tasks) {
@@ -248,10 +251,12 @@ async function main(): Promise<void> {
             if (row && typeof row["worktreePath"] === "string") {
               if (needsWork) {
                 console.log(`  agent ${id}: initial work`)
+                // oxlint-disable-next-line no-await-in-loop -- sequential agent drive
                 await fakeAgent(id, row["worktreePath"])
                 workDone.add(id)
               } else {
                 console.log(`  agent ${id}: fix round ${rounds}`)
+                // oxlint-disable-next-line no-await-in-loop -- sequential agent drive
                 await fakeAgentFix(id, row["worktreePath"], rounds)
                 mergedOrder.push(`fix:${id}:${rounds}`)
               }
@@ -269,6 +274,7 @@ async function main(): Promise<void> {
             `  reviewers for ${id} round ${rounds + 1}: correctness=${correctnessVerdict}`,
           )
           awaitingVerdict.add(id)
+          // oxlint-disable-next-line no-await-in-loop -- sequential reviewer drive
           await submitReviews(id, correctnessVerdict)
           reviewRounds.set(id, rounds + 1)
         } else if (status !== "reviewing") {

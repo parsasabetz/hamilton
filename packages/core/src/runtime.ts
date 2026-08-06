@@ -181,6 +181,7 @@ export async function createBrain(options: BrainOptions): Promise<BrainHandle> {
       let done = false
       let cursor: string | undefined
       while (!done) {
+        // oxlint-disable-next-line no-await-in-loop -- sequential KV pagination
         const page = await registry.list({
           prefix,
           ...(cursor !== undefined ? { cursor } : {}),
