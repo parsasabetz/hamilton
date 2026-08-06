@@ -9,12 +9,14 @@ import { getLogger } from "@logtape/logtape"
 import { build } from "esbuild"
 import { Miniflare } from "miniflare"
 import { fileURLToPath } from "node:url"
-import type { HamiltonEvent } from "@hamilton/shared"
+import type { HamiltonEvent, HamiltonConfig } from "@hamilton/shared"
 
 const logger = getLogger(["hamilton", "core", "runtime"])
 
 export interface BrainOptions {
   persistDir: string
+  /** Resolved Hamilton config, passed to the worker as the CONFIG binding. */
+  config: HamiltonConfig
 }
 
 export interface BrainHandle {
@@ -72,6 +74,7 @@ export async function createBrain(options: BrainOptions): Promise<BrainHandle> {
     r2Buckets: { ARTIFACTS: "ham-artifacts" },
     queueProducers: { BUS: "ham-bus" },
     queueConsumers: { "ham-bus": {} },
+    bindings: { CONFIG: JSON.stringify(options.config) },
     kvPersist: options.persistDir,
     r2Persist: options.persistDir,
     durableObjectsPersist: options.persistDir,

@@ -7,12 +7,15 @@ import { hamiltonEventTypes } from "@hamilton/shared"
 import type { HamiltonEvent } from "@hamilton/shared"
 
 import { createBridge } from "./bridge.ts"
+import { resolveConfig } from "./config.ts"
 import { createBus } from "./eventbus.ts"
 import type { EmitInput } from "./eventbus.ts"
 import { createBrain } from "./runtime.ts"
 import { statusPage } from "./status-page.ts"
+import type { HamiltonConfig } from "@hamilton/shared"
 
 export * from "./bridge.ts"
+export * from "./config.ts"
 export * from "./eventbus.ts"
 export * from "./opencode.ts"
 export * from "./runtime.ts"
@@ -26,6 +29,8 @@ export interface CoreOptions {
   runId?: string
   /** baseUrl of a running `opencode serve` — starts the SSE bridge when set. */
   opencodeUrl?: string
+  /** Hamilton runtime config overrides (defaults apply; see shared schema). */
+  config?: Partial<HamiltonConfig>
 }
 
 export interface CoreHandle {
@@ -76,8 +81,9 @@ export async function startCore(
   const port = options.port ?? 8787
   const persistDir = options.persistDir ?? ".mf"
   const defaultRunId = options.runId ?? "local-run"
+  const config = resolveConfig(options.config)
 
-  const brain = await createBrain({ persistDir })
+  const brain = await createBrain({ persistDir, config })
   const bus = createBus({ brain, runId: defaultRunId })
 
   const listeners = new Set<(event: HamiltonEvent) => void>()
