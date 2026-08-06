@@ -3,6 +3,9 @@
 
 import { configureSync, getConsoleSink, getLogger } from "@logtape/logtape"
 
+export * from "./bridge.ts"
+export * from "./opencode.ts"
+
 export interface CoreOptions {
   port?: number
 }

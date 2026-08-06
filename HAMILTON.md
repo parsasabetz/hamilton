@@ -3,6 +3,8 @@
 > Named in memory and respect of **Margaret Hamilton** — the software she shipped didn't just run, it _reported on itself_, so humans and machines could trust it in the moment. Hamilton is that philosophy applied to software agents: an orchestrator that autonomously plans, dispatches, supervises, reviews, and retries a team of coding agents — and shows you exactly what it is doing, at all times.
 >
 > Status: **Design document (v0.1)** — authoritative for implementation. Written so a fresh engineer, or a fresh orchestrator session, can rebuild Hamilton from this file alone.
+>
+> Operational docs: **FEATURES.md** (ranked feature tiers, Level 1 = the necessary feature) · **ROADMAP.md** (remaining work per milestone).
 
 ## 0. Decision ledger
 
@@ -120,29 +122,35 @@ interface HamiltonEvent {
 
 ### 4.3 Event types
 
-| Domain | Type                                               | Emitted by     | Meaning                                        |
-| ------ | -------------------------------------------------- | -------------- | ---------------------------------------------- |
-| agent  | `agent.claimed`                                    | agent (MCP)    | Read the brief; plan recorded                  |
-| agent  | `agent.started`                                    | agent (MCP)    | First concrete action taken                    |
-| agent  | `agent.milestone`                                  | agent (MCP)    | File/tests/commit done; message = checkpoint   |
-| agent  | `agent.heartbeat`                                  | agent (MCP)    | Liveness; resets AgentDO expiry alarm          |
-| agent  | `agent.error`                                      | agent (MCP)    | Error + impact + recovery                      |
-| agent  | `agent.blocked`                                    | agent (MCP)    | Hard blocker; implies question file            |
-| agent  | `agent.ready_for_review`                           | agent (MCP)    | Done; PR URL, branch, test/check status        |
-| agent  | `agent.subagent_spawned` / `agent.subagent_result` | agent (MCP)    | Subagent responsibilities + outcome            |
-| agent  | `agent.died`                                       | AgentDO alarm  | Heartbeat expired / session vanished           |
-| review | `review.assigned` / `review.started`               | RunDO          | Reviewer session dispatched                    |
-| review | `review.submitted`                                 | reviewer (MCP) | Review document filed (R2 ref in payload)      |
-| review | `review.verdict`                                   | RunDO          | PASS / FAIL aggregated                         |
-| task   | `task.dispatched`                                  | RunDO          | Session created, brief injected                |
-| task   | `task.status_changed`                              | TaskDO         | Lifecycle transition                           |
-| task   | `task.merged`                                      | RunDO          | Owner confirmed + merge executed               |
-| task   | `task.escalated` / `task.blocked`                  | RunDO          | Failure handling                               |
-| run    | `run.planned`                                      | RunDO          | Graph rendered; dispatch begins                |
-| run    | `run.pause` / `run.resume` / `run.finish`          | RunDO/owner    | Run control                                    |
-| system | `budget.exceeded`                                  | Core           | 50% stop-and-report line crossed               |
-| system | `owner.action`                                     | Core           | Merge confirmed / question answered / override |
-| system | `system.error`                                     | any            | Internal failure; always lands in R2           |
+| Domain    | Type                                                     | Emitted by     | Meaning                                                                       |
+| --------- | -------------------------------------------------------- | -------------- | ----------------------------------------------------------------------------- |
+| agent     | `agent.claimed`                                          | agent (MCP)    | Read the brief; plan recorded                                                 |
+| agent     | `agent.started`                                          | agent (MCP)    | First concrete action taken                                                   |
+| agent     | `agent.milestone`                                        | agent (MCP)    | File/tests/commit done; message = checkpoint                                  |
+| agent     | `agent.heartbeat`                                        | agent (MCP)    | Liveness; resets AgentDO expiry alarm                                         |
+| agent     | `agent.error`                                            | agent (MCP)    | Error + impact + recovery                                                     |
+| agent     | `agent.blocked`                                          | agent (MCP)    | Hard blocker; implies question file                                           |
+| agent     | `agent.ready_for_review`                                 | agent (MCP)    | Done; PR URL, branch, test/check status                                       |
+| agent     | `agent.subagent_spawned` / `agent.subagent_result`       | agent (MCP)    | Subagent responsibilities + outcome                                           |
+| agent     | `agent.stalled`                                          | Core bridge    | Busy session, no stream activity ≥ stallTimeout — model hung / tool stuck     |
+| agent     | `agent.idle`                                             | Core bridge    | Session turned busy → idle; RunDO pairs with task state to catch silent quits |
+| agent     | `agent.died`                                             | AgentDO alarm  | Heartbeat expired / session vanished                                          |
+| review    | `review.assigned` / `review.started`                     | RunDO          | Reviewer session dispatched                                                   |
+| review    | `review.submitted`                                       | reviewer (MCP) | Review document filed (R2 ref in payload)                                     |
+| review    | `review.verdict`                                         | RunDO          | PASS / FAIL aggregated                                                        |
+| task      | `task.dispatched`                                        | RunDO          | Session created, brief injected                                               |
+| task      | `task.status_changed`                                    | TaskDO         | Lifecycle transition                                                          |
+| task      | `task.merged`                                            | RunDO          | Owner confirmed + merge executed                                              |
+| task      | `task.escalated` / `task.blocked`                        | RunDO          | Failure handling                                                              |
+| run       | `run.planned`                                            | RunDO          | Graph rendered; dispatch begins                                               |
+| run       | `run.pause` / `run.resume` / `run.finish`                | RunDO/owner    | Run control                                                                   |
+| system    | `budget.exceeded`                                        | Core           | 50% stop-and-report line crossed                                              |
+| system    | `owner.action`                                           | Core           | Merge confirmed / question answered / override                                |
+| system    | `system.error`                                           | any            | Internal failure; always lands in R2                                          |
+| telemetry | `telemetry.opencode`                                     | Core bridge    | Raw OpenCode SSE event passthrough (audit/dashboard/RunDO policy input)       |
+| telemetry | `telemetry.stream_lost` / `telemetry.stream_reconnected` | Core bridge    | SSE observation gap — liveness data untrustworthy while down                  |
+
+**Why Hamilton events are not OpenCode events.** OpenCode's own `/event` stream (session.updated, message.part.updated, todo.updated, session.error, vcs.branch.updated, …) is low-level session telemetry: what happened _inside_ the tool. It has no concept of tasks, contracts, review verdicts, merges, budgets, heartbeats, or death — and it never emits "died"; a dead session is just a silent stream. Hamilton events are domain semantics (intent declared via MCP, state-machine transitions, derived liveness), so the two layers compose instead of overlap: the Core's bridge subscribes to OpenCode's stream and forwards raw telemetry as `telemetry.*` events (terminal tails, todo/session detail, permission requests, error candidates) that enrich the projections — while Hamilton events drive the decisions.
 
 ### 4.4 Flow
 
@@ -236,7 +244,7 @@ The Core drives OpenCode through `@opencode-ai/sdk` (ref: [SDK](https://opencode
 1. **Create:** `client.session.create({ title, body })` → session id registered in KV session registry.
 2. **Brief injection:** `client.session.prompt({ noReply: true, parts: [brief...] })` — context without triggering a response.
 3. **Run:** `client.session.prompt({ parts: [task prompt], agent, model })` — awaited asynchronously; completion detected via SSE, not blocking.
-4. **Watch:** SSE `/event` stream — session/message/permission events forwarded to the bus as observability events and drive the permission auto-responder.
+4. **Watch:** the Core's SSE bridge (`packages/core/src/bridge.ts`) subscribes to `/event` and re-emits every raw event as `telemetry.opencode`. For each **tracked** session (only sessions the orchestrator owns are watched — `track()` on dispatch, `untrack()` on completion), the bridge derives liveness: `agent.stalled` when a busy session shows no stream activity past the stall timeout, `agent.idle` on busy → idle transitions, and `telemetry.stream_lost/reconnected` when the observation channel itself fails. Raw events (message/todo/permission/session) drive the permission auto-responder and dashboard detail. Heartbeats (MCP) are a secondary signal — the stream is authoritative.
 5. **Abort:** `client.session.abort()` on failure handling or owner pause.
 6. **Inspect:** `session.diff`, `session.todo`, `session.messages` for gate and dashboard detail.
 7. **Permissions:** auto-responder answers `POST /session/:id/permissions/:permissionID` — `allow` within role policy (e.g. `git push <own branch>` for implementers), `deny` otherwise; `ask` never left unanswered.
@@ -319,14 +327,16 @@ Numbered end-to-end (each step cites its `.agent-state` ancestor):
 
 ## 12. Failure semantics
 
-| Scenario                   | Detection                                    | Recovery                                                                                                                                                                                                       |
-| -------------------------- | -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Agent never starts**     | `claim-deadline` alarm (AgentDO)             | Respawn: fresh session, same brief, "inspect and continue"                                                                                                                                                     |
-| **Agent dies / quits**     | `heartbeat-expiry` alarm (AgentDO)           | Abort session if alive → respawn with continue instruction (never restart from scratch — ORCHESTRATOR.md §7.4)                                                                                                 |
-| **Agent pauses / freezes** | heartbeat stalls + no progress events        | Owner sees `STALE` on dashboard; auto-resume via injected nudge prompt; escalate if repeated                                                                                                                   |
-| **Session breaks**         | SSE reconnect loss / session registry lookup | Reconnect; resume via registry (session id keyed by taskId); respawn session if unrecoverable                                                                                                                  |
-| **Task fails**             | gate FAIL or `agent.error`                   | `retry-once` → fresh-context agent, same branch, continue; second failure → `escalate` → mark `blocked`, gate dependents, write escalation report; unrelated parallel tasks continue (graph.yaml `on_failure`) |
-| **Orchestrator crashes**   | Core restarts; Brain persisted               | **Resumption protocol:** read KV/DO state, replay event log, restore alarms, continue the loop (ORCHESTRATOR.md §7)                                                                                            |
+| Scenario                   | Detection                                                                                                 | Recovery                                                                                                                                                                                                       |
+| -------------------------- | --------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Agent never starts**     | `claim-deadline` alarm (AgentDO)                                                                          | Respawn: fresh session, same brief, "inspect and continue"                                                                                                                                                     |
+| **Agent dies / quits**     | `heartbeat-expiry` alarm (AgentDO) + bridge stream loss / `agent.stalled`                                 | Abort session if alive → respawn with continue instruction (never restart from scratch — ORCHESTRATOR.md §7.4)                                                                                                 |
+| **Agent stalls mid-turn**  | bridge: busy session, no stream activity ≥ stall timeout → `agent.stalled` (model hung / tool call stuck) | Verify via `/session/status` + messages → `abort` → respawn with continue instruction; guard tool timeouts via `OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS`                                                 |
+| **Agent goes quiet**       | bridge: `agent.idle` (busy → idle) while task still in-progress with no `ready_for_review`                | RunDO pairs idle signal with task state → nudge prompt; repeated → treat as quit (§13.1 path)                                                                                                                  |
+| **Agent pauses / freezes** | `agent.stalled` + no progress events                                                                      | Owner sees `STALE` on dashboard; auto-resume via injected nudge prompt; escalate if repeated                                                                                                                   |
+| **Session breaks**         | bridge `telemetry.stream_lost` + reconnect with backoff; session registry lookup                          | Reconnect; resume via registry (session id keyed by taskId); respawn session if unrecoverable                                                                                                                  |
+| **Task fails**             | gate FAIL or `agent.error`                                                                                | `retry-once` → fresh-context agent, same branch, continue; second failure → `escalate` → mark `blocked`, gate dependents, write escalation report; unrelated parallel tasks continue (graph.yaml `on_failure`) |
+| **Orchestrator crashes**   | Core restarts; Brain persisted                                                                            | **Resumption protocol:** read KV/DO state, replay event log, restore alarms, continue the loop (ORCHESTRATOR.md §7)                                                                                            |
 
 ## 13. Budget & cost control
 

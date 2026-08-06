@@ -27,6 +27,9 @@ export type EventType =
   | "agent.subagent_spawned"
   | "agent.subagent_result"
   | "agent.died"
+  // agent domain — bridge-derived liveness (from the OpenCode SSE stream)
+  | "agent.stalled"
+  | "agent.idle"
   // review domain
   | "review.assigned"
   | "review.started"
@@ -43,6 +46,10 @@ export type EventType =
   | "run.pause"
   | "run.resume"
   | "run.finish"
+  // telemetry domain — raw OpenCode stream passthrough (bridge)
+  | "telemetry.opencode"
+  | "telemetry.stream_lost"
+  | "telemetry.stream_reconnected"
   // system domain
   | "budget.exceeded"
   | "owner.action"
