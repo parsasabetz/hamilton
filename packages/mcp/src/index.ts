@@ -1,18 +1,30 @@
 // Hamilton MCP server (HAMILTON.md §7) — stdio, built on @modelcontextprotocol/sdk.
 // Tool registry from @hamilton/shared; handlers emit events onto the Core bus
-// through the client.ts shim (M1).
+// through the client.ts shim (M1). The conductor tools (start_run, run_status)
+// call the Core HTTP surface directly through the same client.
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { configureSync, getConsoleSink, getLogger } from "@logtape/logtape"
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js"
 import {
+  checkpointMatrixError,
+  checkpointPhaseStatus,
+  checkpointPhases,
   hamiltonToolSpecs,
+  type CheckpointPhase,
+  type CheckpointStatus,
   type EventType,
   type HamiltonToolName,
   type HamiltonToolSpec,
 } from "@hamilton/shared"
-import { createShim, isEventType, type ShimHandle } from "./client.ts"
+import {
+  createShim,
+  getRunStatus,
+  isEventType,
+  postJson,
+  type ShimHandle,
+} from "./client.ts"
 
 const VERSION = "0.0.0"
 
@@ -39,12 +51,9 @@ if (globalForLogging[LOGGING_KEY] !== true) {
 
 const logger = getLogger(["hamilton", "mcp"])
 
-interface HeartbeatArgs {
-  note?: string
-}
-
-interface CheckpointArgs {
+export interface CheckpointArgs {
   phase: string
+  status: string
   message: string
   files?: string[]
 }
@@ -60,7 +69,7 @@ interface AskQuestionArgs {
   blocking: boolean
 }
 
-interface ReportSubagentArgs {
+export interface ReportSubagentArgs {
   role: string
   objective: string
   result: string
@@ -87,6 +96,16 @@ export interface SubmitReviewArgs {
   summary?: string
 }
 
+interface StartRunArgs {
+  planJson?: string
+  prompt?: string
+  mergeAuthority?: "autonomous" | "owner-gated"
+}
+
+interface RunStatusArgs {
+  runId: string
+}
+
 // M3 — the review.submitted payload builder; findings default to [] (the zod
 // spec's .default([]) carries through), everything else stays omitted when
 // undefined.
@@ -103,6 +122,69 @@ export function submitReviewPayload(
     payload["testsWritten"] = args.testsWritten
   if (args.summary !== undefined) payload["summary"] = args.summary
   return payload
+}
+
+// The phase field carries the domain meaning (HAMILTON.md §7): a checkpoint's
+// phase selects the emitted event type; working/milestone record progress.
+export function checkpointEventType(phase: string): EventType {
+  if (phase === "claimed") return "agent.claimed"
+  if (phase === "started") return "agent.started"
+  if (phase === "ready-for-review") return "agent.ready_for_review"
+  if (phase === "error") return "agent.error"
+  if (phase === "blocked") return "agent.blocked"
+  return "agent.milestone"
+}
+
+export function checkpointPayload(
+  args: CheckpointArgs,
+): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
+    phase: args.phase,
+    status: args.status,
+    message: args.message,
+  }
+  if (args.files !== undefined) payload["files"] = args.files
+  return payload
+}
+
+// The SDK pre-validates against the schema, but the superRefine message may
+// be reformatted in transit — so the handler re-checks the compatibility
+// matrix explicitly and surfaces the byte-exact error text.
+export function validateCheckpoint(
+  args: CheckpointArgs,
+): { ok: true } | { ok: false; error: string } {
+  if (!(checkpointPhases as readonly string[]).includes(args.phase)) {
+    return { ok: false, error: `unknown checkpoint phase: ${args.phase}` }
+  }
+  const allowed = checkpointPhaseStatus[args.phase as CheckpointPhase]
+  if (
+    allowed !== undefined &&
+    !allowed.includes(args.status as CheckpointStatus)
+  ) {
+    return { ok: false, error: checkpointMatrixError(args.phase, args.status) }
+  }
+  return { ok: true }
+}
+
+// report_subagent emits two deterministic events: the spawn record first
+// (mandatory per-brief protocol), then the result.
+export function subagentEvents(
+  args: ReportSubagentArgs,
+): Array<{ type: EventType; payload: Record<string, unknown> }> {
+  return [
+    {
+      type: "agent.subagent_spawned",
+      payload: { role: args.role, objective: args.objective },
+    },
+    {
+      type: "agent.subagent_result",
+      payload: {
+        role: args.role,
+        objective: args.objective,
+        result: args.result,
+      },
+    },
+  ]
 }
 
 function toolSpec(name: HamiltonToolName): HamiltonToolSpec {
@@ -146,25 +228,73 @@ async function emitAndRespond(
   }
 }
 
+// Dual-emission helper: the spawn record is mandatory, so a failed spawn is a
+// hard error; a failed result still reports the spawn's status.
+async function emitBoth(
+  shim: ShimHandle,
+  toolName: string,
+  events: Array<{ type: EventType; payload: Record<string, unknown> }>,
+): Promise<CallToolResult> {
+  const spawnEvent = events[0]
+  const resultEvent = events[1]
+  if (spawnEvent === undefined || resultEvent === undefined) {
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `[hamilton:${toolName}] requires spawn and result events`,
+        },
+      ],
+      isError: true,
+    }
+  }
+  const spawn = await shim.emit(spawnEvent.type, spawnEvent.payload)
+  logger.info("Emitted {name} ok={ok} eventId={eventId} (spawn)", {
+    name: toolName,
+    ok: spawn.ok,
+    eventId: spawn.eventId,
+  })
+  if (!spawn.ok) {
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `[hamilton:${toolName}] spawn emit failed: ${spawn.error ?? "unknown error"}`,
+        },
+      ],
+      isError: true,
+    }
+  }
+  const result = await shim.emit(resultEvent.type, resultEvent.payload)
+  logger.info("Emitted {name} ok={ok} eventId={eventId} (result)", {
+    name: toolName,
+    ok: result.ok,
+    eventId: result.eventId,
+  })
+  if (!result.ok) {
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `[hamilton:${toolName}] spawn ok (${spawn.eventId ?? "?"}) but result emit failed: ${result.error ?? "unknown error"}`,
+        },
+      ],
+      isError: true,
+    }
+  }
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: `[hamilton:${toolName}] spawned ${spawn.eventId} seq ${spawn.seq}; result ${result.eventId} seq ${result.seq}`,
+      },
+    ],
+  }
+}
+
 export function createMcpServer(): McpServer {
   const shim = createShim()
   const server = new McpServer({ name: "hamilton", version: VERSION })
-
-  const heartbeat = toolSpec("heartbeat")
-  server.registerTool(
-    heartbeat.name,
-    {
-      title: heartbeat.name,
-      description: heartbeat.description,
-      inputSchema: heartbeat.inputSchema,
-    },
-    async (args: unknown): Promise<CallToolResult> => {
-      const { note } = args as HeartbeatArgs
-      const payload: Record<string, unknown> = {}
-      if (note !== undefined) payload["note"] = note
-      return emitAndRespond(shim, heartbeat.name, "agent.heartbeat", payload)
-    },
-  )
 
   const checkpoint = toolSpec("checkpoint")
   server.registerTool(
@@ -175,20 +305,20 @@ export function createMcpServer(): McpServer {
       inputSchema: checkpoint.inputSchema,
     },
     async (args: unknown): Promise<CallToolResult> => {
-      const { phase, message, files } = args as CheckpointArgs
-      const payload: Record<string, unknown> = { phase, message }
-      if (files !== undefined) payload["files"] = files
-      // The phase field carries the domain meaning (HAMILTON.md §7): a
-      // checkpoint's phase selects the emitted event type.
-      const eventType =
-        phase === "claimed"
-          ? "agent.claimed"
-          : phase === "started"
-            ? "agent.started"
-            : phase === "ready-for-review"
-              ? "agent.ready_for_review"
-              : "agent.milestone"
-      return emitAndRespond(shim, checkpoint.name, eventType, payload)
+      const checkpointArgs = args as CheckpointArgs
+      const validation = validateCheckpoint(checkpointArgs)
+      if (!validation.ok) {
+        return {
+          content: [{ type: "text" as const, text: validation.error }],
+          isError: true,
+        }
+      }
+      return emitAndRespond(
+        shim,
+        checkpoint.name,
+        checkpointEventType(checkpointArgs.phase),
+        checkpointPayload(checkpointArgs),
+      )
     },
   )
 
@@ -242,16 +372,10 @@ export function createMcpServer(): McpServer {
       inputSchema: reportSubagent.inputSchema,
     },
     async (args: unknown): Promise<CallToolResult> => {
-      const { role, objective, result } = args as ReportSubagentArgs
-      return emitAndRespond(
+      return emitBoth(
         shim,
         reportSubagent.name,
-        "agent.subagent_result",
-        {
-          role,
-          objective,
-          result,
-        },
+        subagentEvents(args as ReportSubagentArgs),
       )
     },
   )
@@ -294,6 +418,81 @@ export function createMcpServer(): McpServer {
         "review.submitted",
         submitReviewPayload(review),
       )
+    },
+  )
+
+  const startRun = toolSpec("start_run")
+  server.registerTool(
+    startRun.name,
+    {
+      title: startRun.name,
+      description: startRun.description,
+      inputSchema: startRun.inputSchema,
+    },
+    async (args: unknown): Promise<CallToolResult> => {
+      const { planJson, prompt, mergeAuthority } = args as StartRunArgs
+      const body: Record<string, unknown> = {}
+      if (planJson !== undefined) body["planJson"] = planJson
+      if (prompt !== undefined) body["prompt"] = prompt
+      if (mergeAuthority !== undefined) body["mergeAuthority"] = mergeAuthority
+      const result = await postJson(shim.coreUrl, "/api/run", body)
+      const data = result.data
+      const runId =
+        typeof data === "object" && data !== null
+          ? (data as Record<string, unknown>)["runId"]
+          : undefined
+      if (result.ok && typeof runId === "string") {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `[hamilton:start_run] run started: ${runId}`,
+            },
+          ],
+        }
+      }
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `[hamilton:start_run] failed: ${result.error ?? "unexpected core response"}`,
+          },
+        ],
+        isError: true,
+      }
+    },
+  )
+
+  const runStatus = toolSpec("run_status")
+  server.registerTool(
+    runStatus.name,
+    {
+      title: runStatus.name,
+      description: runStatus.description,
+      inputSchema: runStatus.inputSchema,
+    },
+    async (args: unknown): Promise<CallToolResult> => {
+      const { runId } = args as RunStatusArgs
+      const result = await getRunStatus(shim.coreUrl, runId)
+      if (result.ok) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(result.data, null, 2),
+            },
+          ],
+        }
+      }
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `[hamilton:run_status] failed: ${result.error ?? "unknown error"}`,
+          },
+        ],
+        isError: true,
+      }
     },
   )
 
