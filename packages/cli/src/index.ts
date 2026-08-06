@@ -4,6 +4,7 @@ import { defineCommand, runMain } from "citty"
 import { startCore } from "@hamilton/core"
 import { startConductor } from "./conductor.ts"
 import { initProject } from "./init.ts"
+import { runHamilton } from "./run.ts"
 
 const main = defineCommand({
   meta: {
@@ -30,6 +31,57 @@ const main = defineCommand({
         console.log(
           "Hamilton initialized. Edit hamilton.config.ts to tune the run policy.",
         )
+      },
+    }),
+    run: defineCommand({
+      meta: {
+        name: "run",
+        description:
+          "Execute a plan autonomously: decompose a prompt or load a plan file",
+      },
+      args: {
+        prompt: {
+          type: "positional",
+          description: "The request to decompose into a task graph",
+          required: false,
+        },
+        plan: {
+          type: "string",
+          description: "Path to a JSON plan (alternative to prompt)",
+        },
+        port: {
+          type: "string",
+          description: "Core port",
+          default: "8787",
+        },
+        "merge-authority": {
+          type: "string",
+          description: "autonomous | owner-gated",
+        },
+        runId: {
+          type: "string",
+          description: "Run id (default: run-<timestamp>)",
+        },
+      },
+      async run({ args }) {
+        try {
+          const result = await runHamilton({
+            ...(args.prompt ? { prompt: args.prompt } : {}),
+            ...(args.plan ? { planFile: args.plan } : {}),
+            port: Number(args.port ?? "8787"),
+            ...(args.runId ? { runId: args.runId } : {}),
+            ...(args["merge-authority"] === "autonomous" ||
+            args["merge-authority"] === "owner-gated"
+              ? { mergeAuthority: args["merge-authority"] }
+              : {}),
+          })
+          console.log(result.report)
+          process.exitCode = result.exitCode
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          console.error(`hamilton run failed: ${message}`)
+          process.exitCode = 1
+        }
       },
     }),
     dev: defineCommand({
