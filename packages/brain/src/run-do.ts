@@ -73,6 +73,16 @@ export interface TaskRunState {
   reviewWorktreePath?: string
   /** All findings accumulated across reviewers since the last fresh gate. */
   reviewFindings?: ReviewFinding[]
+  /** pr.verify result — informational PR verification shown to reviewers;
+   *  stored once from the pr.verify CoreActionResult. Gates nothing. */
+  prVerification?: PrVerification
+}
+
+export interface PrVerification {
+  verified: boolean
+  prUrl?: string
+  base?: string
+  reason?: string
 }
 
 export interface AgentRunState {
@@ -88,6 +98,18 @@ export interface AgentRunState {
   lastCommand?: string
   zoneViolations: number
   milestoneCount: number
+  /** Last reported self-assessment (checkpoint status). */
+  status?: "working" | "blocked" | "complete"
+  lastPhase?: string
+  lastReportAt?: string
+  lastMessage?: string
+  lastFiles?: string[]
+  claimedAt?: string
+  startedAt?: string
+  errorCount?: number
+  subagentCount?: number
+  lastSubagentRole?: string
+  lastReadyAt?: string
 }
 
 // Conductor-owned git state for one worktree branch (worktree.* events).
@@ -176,6 +198,27 @@ function stringArray(value: unknown): string[] | undefined {
     if (typeof item !== "string") return undefined
   }
   return value
+}
+
+// Reported fields from a checkpoint payload ({ phase, status, message, files })
+// for the agent's protocol bookkeeping. Every checkpoint-mapped event stores
+// these defensively — old sessions may omit any of them; only what is present
+// lands in the row, and lastReportAt always reflects the event itself.
+function checkpointReported(
+  payload: Record<string, unknown>,
+  ts: string,
+): Partial<AgentRunState> {
+  const patch: Partial<AgentRunState> = { lastReportAt: ts }
+  const status = payload.status
+  if (status === "working" || status === "blocked" || status === "complete") {
+    patch.status = status
+  }
+  if (typeof payload.phase === "string") patch.lastPhase = payload.phase
+  const message = payload.message
+  if (typeof message === "string") patch.lastMessage = message.slice(0, 200)
+  const files = stringArray(payload.files)
+  if (files !== undefined) patch.lastFiles = files
+  return patch
 }
 
 // Telemetry-derived supervision — pure extracts over a telemetry.opencode
@@ -267,6 +310,85 @@ export function agentLogKey(
 ): string {
   const padded = String(seq).padStart(10, "0")
   return `artifacts/${runId}/agent-${agentId}/${kind}/${padded}-${suffix ?? Date.now()}.json`
+}
+
+// ── Deterministic protocol bookkeeping (HAMILTON.md §7) ─────────────────────
+//
+// Pure compliance over a task's agent rows: did the agent claim, start, do
+// work, and declare ready in the canonical order? Violations are derived from
+// the stored timestamps only, so they reproduce exactly from any snapshot:
+//   - work (milestone / heartbeat / ready) with claimedAt missing → "work
+//     before claim" (started/working state alone does not count — old sessions
+//     that skipped agent.claimed stay flaggable);
+//   - ready without claimedAt → "no claim at ready time";
+//   - ready without startedAt → "no start at ready time".
+
+export interface ProtocolCompliance {
+  claimed: boolean
+  started: boolean
+  milestones: number
+  errorsReported: number
+  subagentsReported: number
+  ready: boolean
+  violations: string[]
+}
+
+// States an agent can only reach after claiming (fallback for sessions where
+// claimedAt was never stored but the lifecycle clearly progressed).
+const CLAIMED_OR_LATER = new Set([
+  "claimed",
+  "started",
+  "working",
+  "ready-for-review",
+  "idle",
+  "died",
+  "error",
+  "blocked",
+])
+
+export function protocolCompliance(
+  snapshot: RunSnapshot,
+  taskId: string,
+): ProtocolCompliance {
+  const agents = Object.values(snapshot.agents).filter(
+    (agent) => agent.taskId === taskId,
+  )
+  const claimed = agents.some(
+    (agent) =>
+      agent.claimedAt !== undefined || CLAIMED_OR_LATER.has(agent.state),
+  )
+  const started = agents.some((agent) => agent.startedAt !== undefined)
+  const ready = agents.some((agent) => agent.lastReadyAt !== undefined)
+  const milestones = agents.reduce(
+    (total, agent) => total + agent.milestoneCount,
+    0,
+  )
+  const errorsReported = agents.reduce(
+    (total, agent) => total + (agent.errorCount ?? 0),
+    0,
+  )
+  const subagentsReported = agents.reduce(
+    (total, agent) => total + (agent.subagentCount ?? 0),
+    0,
+  )
+  const claimedAtSet = agents.some((agent) => agent.claimedAt !== undefined)
+  const work =
+    milestones > 0 ||
+    agents.some((agent) => agent.heartbeatAt !== undefined) ||
+    ready
+  const violations: string[] = []
+  if (work && !claimedAtSet) violations.push("work before claim")
+  if (ready && !claimedAtSet) violations.push("no claim at ready time")
+  if (ready && !started) violations.push("no start at ready time")
+  return {
+    claimed,
+    started,
+    milestones,
+    errorsReported,
+    subagentsReported,
+    ready,
+    violations,
+  }
 }
 
 // ── M2: composite activity (HAMILTON.md §"Composite activity") ──────────────
@@ -414,6 +536,9 @@ export function decideGate(
 // One CoreAction per task per category, nothing while stopping/finished:
 //   - worktree.ensure for every dispatch candidate (branch defaults to
 //     `feat/${taskId}` when the graph carries none);
+//   - pr.verify for every ready/reviewing task whose verification has not
+//     landed yet (issued ONCE — the result is stored on the task row and
+//     blocks re-issue; runs in parallel with the review gate);
 //   - review.start for every ready-for-review task whose gate has not been
 //     populated yet (fresh gate; a rejection resets reviewers in applyEvent,
 //     so the gate re-runs after fixes);
@@ -456,6 +581,18 @@ export function actionsFor(
     actions.push(action)
   }
   for (const [taskId, task] of Object.entries(snapshot.tasks)) {
+    if (
+      (task.status === "ready-for-review" || task.status === "reviewing") &&
+      task.prVerification === undefined
+    ) {
+      issue({
+        action: "pr.verify",
+        runId,
+        taskId,
+        branch: task.branch ?? `feat/${taskId}`,
+        parent,
+      })
+    }
     if (
       task.status === "ready-for-review" &&
       (task.reviewers === undefined || task.reviewers.length === 0)
@@ -885,6 +1022,10 @@ export function applyEvent(
         failures: 0,
         zoneViolations: 0,
         milestoneCount: 0,
+        ...(evt.type === "agent.started"
+          ? { startedAt: evt.ts }
+          : { claimedAt: evt.ts }),
+        ...checkpointReported(payload, evt.ts),
         ...(evt.taskId !== undefined ? { taskId: evt.taskId } : {}),
       }
       let next = setAgent(snapshot, agent)
@@ -920,6 +1061,7 @@ export function applyEvent(
           lastActivityAt: evt.ts,
           milestoneCount: (current?.milestoneCount ?? 0) + 1,
           ...(taskId !== undefined ? { taskId } : {}),
+          ...checkpointReported(payload, evt.ts),
         }
         if (working) patch.state = "working"
         next = patchAgent(next, agentId, patch)
@@ -955,7 +1097,10 @@ export function applyEvent(
         }
       }
       if (agentId !== undefined) {
-        next = patchAgent(next, agentId, { state: "ready-for-review" })
+        next = patchAgent(next, agentId, {
+          state: "ready-for-review",
+          lastReadyAt: evt.ts,
+        })
       }
       return next
     }
@@ -988,12 +1133,46 @@ export function applyEvent(
     case "agent.error": {
       const agentId = evt.agentId
       if (agentId === undefined) return snapshot
-      const failures = (snapshot.agents[agentId]?.failures ?? 0) + 1
-      let next = patchAgent(snapshot, agentId, { state: "error", failures })
+      const current = snapshot.agents[agentId]
+      const failures = (current?.failures ?? 0) + 1
+      let next = patchAgent(snapshot, agentId, {
+        state: "error",
+        failures,
+        errorCount: (current?.errorCount ?? 0) + 1,
+        ...checkpointReported(payload, evt.ts),
+      })
       if (config !== undefined && shouldStop(next, config)) {
         next = { ...next, phase: "stopping" }
       }
       return next
+    }
+    case "agent.blocked": {
+      // Checkpoint phase "blocked" (agent self-report). Unknown agents are
+      // ignored — the row must exist for the report to attach to.
+      const agentId = evt.agentId
+      if (agentId === undefined) return snapshot
+      if (snapshot.agents[agentId] === undefined) return snapshot
+      return patchAgent(snapshot, agentId, {
+        state: "blocked",
+        ...checkpointReported(payload, evt.ts),
+      })
+    }
+    case "agent.subagent_spawned": {
+      const agentId = evt.agentId
+      if (agentId === undefined) return snapshot
+      const role = typeof payload.role === "string" ? payload.role : undefined
+      return patchAgent(snapshot, agentId, {
+        subagentCount: (snapshot.agents[agentId]?.subagentCount ?? 0) + 1,
+        ...(role !== undefined ? { lastSubagentRole: role } : {}),
+      })
+    }
+    case "agent.subagent_result": {
+      const agentId = evt.agentId
+      if (agentId === undefined) return snapshot
+      const role = typeof payload.role === "string" ? payload.role : undefined
+      return role === undefined
+        ? snapshot
+        : patchAgent(snapshot, agentId, { lastSubagentRole: role })
     }
     case "agent.command": {
       const agentId = evt.agentId
@@ -1538,6 +1717,19 @@ export class RunDO extends DurableObject<Env> {
             `failed:${runId}:${action.taskId}:${action.action}`,
             result.error,
           )
+        } else if (
+          action.action === "pr.verify" &&
+          result.prVerification !== undefined
+        ) {
+          // The verification landed: persist it on the task row so actionsFor
+          // stops issuing pr.verify (the issued marker stays up — no re-issue
+          // after the result is stored).
+          // oxlint-disable-next-line no-await-in-loop
+          await this.storePrVerification(
+            runId,
+            action.taskId,
+            result.prVerification,
+          )
         }
       } catch (error) {
         // oxlint-disable-next-line no-await-in-loop
@@ -1549,6 +1741,47 @@ export class RunDO extends DurableObject<Env> {
         )
       }
     }
+  }
+
+  // pr.verify result write-through: patch the task row in DO storage AND
+  // rewrite the REGISTRY run snapshot in the same shape the /event write-through
+  // produces, so dashboards see the verification without waiting for the next
+  // bus event.
+  private async storePrVerification(
+    runId: string,
+    taskId: string,
+    verification: PrVerification,
+  ): Promise<void> {
+    const [tasks, agents, phase, lastSeq, branches, parent] = await Promise.all(
+      [
+        this.ctx.storage.get<Record<string, TaskRunState>>(KEYS.tasks),
+        this.ctx.storage.get<Record<string, AgentRunState>>(KEYS.agents),
+        this.ctx.storage.get<string>(KEYS.phase),
+        this.ctx.storage.get<number>(KEYS.lastSeq),
+        this.ctx.storage.get<Record<string, BranchRunState>>(KEYS.branches),
+        this.ctx.storage.get<string>(KEYS.parent),
+      ],
+    )
+    const task = tasks?.[taskId]
+    if (task === undefined) return
+    const nextTasks = {
+      ...tasks,
+      [taskId]: { ...task, prVerification: verification },
+    }
+    await this.ctx.storage.put(KEYS.tasks, nextTasks)
+    await this.env.REGISTRY.put(
+      `state:${runId}:run`,
+      JSON.stringify({
+        runId,
+        phase: phase ?? "planned",
+        seq: lastSeq ?? 0,
+        updatedAt: new Date().toISOString(),
+        parent: parent ?? "",
+        tasks: Object.values(nextTasks),
+        agents: Object.values(agents ?? {}),
+        branches: Object.values(branches ?? {}),
+      }),
+    )
   }
 
   private fire(target: ForwardTarget, runId: string): void {

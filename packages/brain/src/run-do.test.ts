@@ -35,11 +35,13 @@ const {
   mergeTrigger,
   parseTask,
   parseTaskStatus,
+  protocolCompliance,
   recordCommand,
   recordViolation,
   shouldMerge,
   shouldStop,
 } = await import("./run-do.ts")
+const { expiryArmTime, expiryExpired } = await import("./agent-do.ts")
 
 const empty: RunSnapshot = { tasks: {}, agents: {}, phase: "planned" }
 
@@ -612,6 +614,8 @@ const testConfig = (
   provision: { install: "auto" },
   activity: { windowMs: 120_000 },
   mergeAuthority: "owner-gated",
+  parentBranch: "main",
+  protocol: { blockOnViolation: false },
   review: {
     roles: ["correctness", "standards"],
     vetoRoles: ["*"],
@@ -1356,7 +1360,7 @@ describe("shouldMerge / mergeTrigger", () => {
 describe("actionsFor", () => {
   const autonomous = autonomousConfig()
 
-  test("worktree.ensure for planned, review.start for ready tasks", () => {
+  test("worktree.ensure for planned, pr.verify + review.start for ready tasks", () => {
     const snapshot = {
       runId: "run-1",
       ...empty,
@@ -1388,6 +1392,13 @@ describe("actionsFor", () => {
         taskId: "t1",
         parent: "main",
         branch: "feat/t1",
+      },
+      {
+        action: "pr.verify",
+        runId: "run-1",
+        taskId: "t2",
+        branch: "feat/t2",
+        parent: "main",
       },
       {
         action: "review.start",
@@ -2001,7 +2012,7 @@ describe("actionsFor review gating", () => {
     },
   })
 
-  test("ready-for-review without reviewers issues review.start with roles/zone/parent", () => {
+  test("ready-for-review without reviewers issues pr.verify + review.start with roles/zone/parent", () => {
     const snapshot = {
       runId: "run-1",
       ...empty,
@@ -2018,6 +2029,13 @@ describe("actionsFor review gating", () => {
       phase: "running",
     }
     expect(actionsFor(snapshot, reviewConfig())).toEqual([
+      {
+        action: "pr.verify",
+        runId: "run-1",
+        taskId: "t1",
+        branch: "feat/t1",
+        parent: "main",
+      },
       {
         action: "review.start",
         runId: "run-1",
@@ -2048,6 +2066,13 @@ describe("actionsFor review gating", () => {
     }
     expect(actionsFor(snapshot, reviewConfig("claude-sonnet"))).toEqual([
       {
+        action: "pr.verify",
+        runId: "run-1",
+        taskId: "t1",
+        branch: "feat/t1",
+        parent: "main",
+      },
+      {
         action: "review.start",
         runId: "run-1",
         taskId: "t1",
@@ -2077,7 +2102,15 @@ describe("actionsFor review gating", () => {
       },
       phase: "running",
     }
-    expect(actionsFor(snapshot, autonomous)).toEqual([])
+    expect(actionsFor(snapshot, autonomous)).toEqual([
+      {
+        action: "pr.verify",
+        runId: "run-1",
+        taskId: "t1",
+        branch: "feat/t1",
+        parent: "main",
+      },
+    ])
   })
 
   test("approved + autonomous → merge.execute; ready-for-review never merges", () => {
@@ -2269,5 +2302,505 @@ describe("actionsFor review gating", () => {
         parent: "main",
       },
     ])
+  })
+})
+
+describe("checkpoint reported fields", () => {
+  test("agent.claimed stores claimedAt and the checkpoint payload fields", () => {
+    const next = applyEvent(
+      empty,
+      evt("agent.claimed", {
+        taskId: "t1",
+        agentId: "a1",
+        payload: {
+          phase: "claimed",
+          status: "working",
+          message: "picking up the task",
+          files: ["packages/brain/src/run-do.ts"],
+        },
+      }),
+    )
+    const agent = next.agents["a1"]
+    expect(agent?.claimedAt).toBe("2026-08-06T00:00:00.000Z")
+    expect(agent?.status).toBe("working")
+    expect(agent?.lastPhase).toBe("claimed")
+    expect(agent?.lastReportAt).toBe("2026-08-06T00:00:00.000Z")
+    expect(agent?.lastMessage).toBe("picking up the task")
+    expect(agent?.lastFiles).toEqual(["packages/brain/src/run-do.ts"])
+  })
+
+  test("agent.started stores startedAt (but not claimedAt) and the checkpoint payload fields", () => {
+    const next = applyEvent(
+      empty,
+      evt("agent.started", {
+        taskId: "t1",
+        agentId: "a1",
+        payload: { phase: "started", status: "working", message: "going" },
+      }),
+    )
+    expect(next.agents["a1"]?.startedAt).toBe("2026-08-06T00:00:00.000Z")
+    expect(next.agents["a1"]?.claimedAt).toBeUndefined()
+    expect(next.agents["a1"]?.lastPhase).toBe("started")
+    expect(next.agents["a1"]?.lastMessage).toBe("going")
+  })
+
+  test("agent.milestone stores reported fields alongside the count", () => {
+    const start = { ...empty, agents: { a1: agentState("a1", "started") } }
+    const next = applyEvent(
+      start,
+      evt("agent.milestone", {
+        agentId: "a1",
+        payload: {
+          phase: "milestone",
+          status: "working",
+          message: "shipped the executor",
+          files: ["packages/brain/src/run-do.ts"],
+        },
+      }),
+    )
+    expect(next.agents["a1"]?.milestoneCount).toBe(1)
+    expect(next.agents["a1"]?.status).toBe("working")
+    expect(next.agents["a1"]?.lastPhase).toBe("milestone")
+    expect(next.agents["a1"]?.lastReportAt).toBe("2026-08-06T00:00:00.000Z")
+    expect(next.agents["a1"]?.lastMessage).toBe("shipped the executor")
+    expect(next.agents["a1"]?.lastFiles).toEqual([
+      "packages/brain/src/run-do.ts",
+    ])
+  })
+
+  test("lastMessage truncates at 200 chars", () => {
+    const long = "x".repeat(250)
+    const next = applyEvent(
+      empty,
+      evt("agent.claimed", {
+        taskId: "t1",
+        agentId: "a1",
+        payload: { phase: "claimed", status: "working", message: long },
+      }),
+    )
+    expect(next.agents["a1"]?.lastMessage).toHaveLength(200)
+    expect(next.agents["a1"]?.lastMessage).toBe("x".repeat(200))
+  })
+
+  test("checkpoint events with empty payloads store defensively", () => {
+    const next = applyEvent(
+      empty,
+      evt("agent.claimed", { taskId: "t1", agentId: "a1", payload: {} }),
+    )
+    expect(next.agents["a1"]?.claimedAt).toBe("2026-08-06T00:00:00.000Z")
+    expect(next.agents["a1"]?.lastReportAt).toBe("2026-08-06T00:00:00.000Z")
+    expect(next.agents["a1"]?.status).toBeUndefined()
+    expect(next.agents["a1"]?.lastPhase).toBeUndefined()
+    expect(next.agents["a1"]?.lastMessage).toBeUndefined()
+  })
+
+  test("agent.error increments errorCount and stores reported fields", () => {
+    const start = { ...empty, agents: { a1: agentState("a1", "working") } }
+    const next = applyEvent(
+      start,
+      evt("agent.error", {
+        agentId: "a1",
+        payload: { phase: "error", status: "blocked", message: "boom" },
+      }),
+    )
+    expect(next.agents["a1"]?.errorCount).toBe(1)
+    expect(next.agents["a1"]?.status).toBe("blocked")
+    expect(next.agents["a1"]?.lastPhase).toBe("error")
+    expect(next.agents["a1"]?.lastMessage).toBe("boom")
+    const twice = applyEvent(
+      next,
+      evt("agent.error", { agentId: "a1", payload: { phase: "error" } }),
+    )
+    expect(twice.agents["a1"]?.errorCount).toBe(2)
+  })
+
+  test("agent.blocked stores reported fields on a known agent", () => {
+    const start = { ...empty, agents: { a1: agentState("a1", "working") } }
+    const next = applyEvent(
+      start,
+      evt("agent.blocked", {
+        agentId: "a1",
+        payload: { phase: "blocked", status: "blocked", message: "stuck" },
+      }),
+    )
+    expect(next.agents["a1"]?.state).toBe("blocked")
+    expect(next.agents["a1"]?.status).toBe("blocked")
+    expect(next.agents["a1"]?.lastPhase).toBe("blocked")
+    expect(next.agents["a1"]?.lastMessage).toBe("stuck")
+  })
+
+  test("agent.ready_for_review stores lastReadyAt", () => {
+    const start = { ...empty, agents: { a1: agentState("a1", "working") } }
+    const next = applyEvent(
+      start,
+      evt("agent.ready_for_review", { agentId: "a1", taskId: "t1" }),
+    )
+    expect(next.agents["a1"]?.lastReadyAt).toBe("2026-08-06T00:00:00.000Z")
+  })
+
+  test("subagent events count subagents and track the last role", () => {
+    const start = { ...empty, agents: { a1: agentState("a1", "working") } }
+    const spawned = applyEvent(
+      start,
+      evt("agent.subagent_spawned", {
+        agentId: "a1",
+        payload: { role: "planner", objective: "draft the plan" },
+      }),
+    )
+    expect(spawned.agents["a1"]?.subagentCount).toBe(1)
+    expect(spawned.agents["a1"]?.lastSubagentRole).toBe("planner")
+    const second = applyEvent(
+      spawned,
+      evt("agent.subagent_spawned", {
+        agentId: "a1",
+        payload: { role: "docs", objective: "write docs" },
+      }),
+    )
+    expect(second.agents["a1"]?.subagentCount).toBe(2)
+    expect(second.agents["a1"]?.lastSubagentRole).toBe("docs")
+    const result = applyEvent(
+      second,
+      evt("agent.subagent_result", {
+        agentId: "a1",
+        payload: { role: "docs", objective: "write docs", result: "done" },
+      }),
+    )
+    expect(result.agents["a1"]?.lastSubagentRole).toBe("docs")
+    expect(result.agents["a1"]?.subagentCount).toBe(2)
+  })
+
+  test("subagent events for unknown agents register them defensively", () => {
+    const spawned = applyEvent(
+      empty,
+      evt("agent.subagent_spawned", {
+        agentId: "ghost",
+        payload: { role: "planner", objective: "plan" },
+      }),
+    )
+    expect(spawned.agents["ghost"]?.subagentCount).toBe(1)
+    expect(spawned.agents["ghost"]?.lastSubagentRole).toBe("planner")
+  })
+})
+
+describe("protocolCompliance", () => {
+  test("full protocol → all true, no violations", () => {
+    const snapshot = {
+      ...empty,
+      agents: {
+        a1: agentState("a1", "working", {
+          taskId: "t1",
+          claimedAt: iso(0),
+          startedAt: iso(1_000),
+          milestoneCount: 3,
+          errorCount: 0,
+          subagentCount: 1,
+          lastReadyAt: iso(5_000),
+        }),
+      },
+    }
+    expect(protocolCompliance(snapshot, "t1")).toEqual({
+      claimed: true,
+      started: true,
+      milestones: 3,
+      errorsReported: 0,
+      subagentsReported: 1,
+      ready: true,
+      violations: [],
+    })
+  })
+
+  test("work without a claim → work before claim", () => {
+    const snapshot = {
+      ...empty,
+      agents: {
+        a1: agentState("a1", "unknown", { taskId: "t1", milestoneCount: 2 }),
+      },
+    }
+    const compliance = protocolCompliance(snapshot, "t1")
+    expect(compliance.claimed).toBe(false)
+    expect(compliance.started).toBe(false)
+    expect(compliance.violations).toContain("work before claim")
+  })
+
+  test("ready without claim or start → all ready-time violations", () => {
+    const snapshot = {
+      ...empty,
+      agents: {
+        a1: agentState("a1", "unknown", { taskId: "t1", lastReadyAt: iso(0) }),
+      },
+    }
+    const compliance = protocolCompliance(snapshot, "t1")
+    expect(compliance.claimed).toBe(false)
+    expect(compliance.started).toBe(false)
+    expect(compliance.ready).toBe(true)
+    expect(compliance.violations).toEqual([
+      "work before claim",
+      "no claim at ready time",
+      "no start at ready time",
+    ])
+  })
+
+  test("ready without start but with claim → no start at ready time only", () => {
+    const snapshot = {
+      ...empty,
+      agents: {
+        a1: agentState("a1", "claimed", {
+          taskId: "t1",
+          claimedAt: iso(0),
+          lastReadyAt: iso(5_000),
+        }),
+      },
+    }
+    const compliance = protocolCompliance(snapshot, "t1")
+    expect(compliance.claimed).toBe(true)
+    expect(compliance.started).toBe(false)
+    expect(compliance.violations).toEqual(["no start at ready time"])
+  })
+
+  test("heartbeat counts as work before a claim", () => {
+    const snapshot = {
+      ...empty,
+      agents: {
+        a1: agentState("a1", "unknown", { taskId: "t1", heartbeatAt: iso(0) }),
+      },
+    }
+    expect(protocolCompliance(snapshot, "t1").violations).toContain(
+      "work before claim",
+    )
+  })
+
+  test("counts reflect errors and subagents across the task's agents", () => {
+    const snapshot = {
+      ...empty,
+      agents: {
+        a1: agentState("a1", "working", {
+          taskId: "t1",
+          claimedAt: iso(0),
+          startedAt: iso(1_000),
+          milestoneCount: 2,
+          errorCount: 1,
+          subagentCount: 2,
+        }),
+        a2: agentState("a2", "working", {
+          taskId: "t1",
+          claimedAt: iso(0),
+          startedAt: iso(2_000),
+          milestoneCount: 1,
+          errorCount: 1,
+        }),
+        other: agentState("other", "working", { taskId: "t9" }),
+      },
+    }
+    const compliance = protocolCompliance(snapshot, "t1")
+    expect(compliance.claimed).toBe(true)
+    expect(compliance.started).toBe(true)
+    expect(compliance.milestones).toBe(3)
+    expect(compliance.errorsReported).toBe(2)
+    expect(compliance.subagentsReported).toBe(2)
+    expect(compliance.violations).toEqual([])
+  })
+
+  test("state fallback marks claimed when claimedAt was never stored", () => {
+    const snapshot = {
+      ...empty,
+      agents: {
+        a1: agentState("a1", "working", { taskId: "t1", milestoneCount: 1 }),
+      },
+    }
+    const compliance = protocolCompliance(snapshot, "t1")
+    expect(compliance.claimed).toBe(true)
+    expect(compliance.violations).toContain("work before claim")
+  })
+
+  test("no agents for the task → nothing claimed/started, no violations", () => {
+    expect(protocolCompliance(empty, "t1")).toEqual({
+      claimed: false,
+      started: false,
+      milestones: 0,
+      errorsReported: 0,
+      subagentsReported: 0,
+      ready: false,
+      violations: [],
+    })
+  })
+})
+
+describe("actionsFor pr.verify", () => {
+  const autonomous = autonomousConfig()
+
+  test("ready-for-review without a stored verification issues pr.verify", () => {
+    const snapshot = {
+      runId: "run-1",
+      ...empty,
+      parent: "main",
+      tasks: {
+        t1: {
+          id: "t1",
+          status: "ready-for-review" as TaskStatus,
+          role: "",
+          zone: [],
+          branch: "feat/t1",
+        },
+      },
+      phase: "running",
+    }
+    expect(actionsFor(snapshot, autonomous)).toContainEqual({
+      action: "pr.verify",
+      runId: "run-1",
+      taskId: "t1",
+      branch: "feat/t1",
+      parent: "main",
+    })
+  })
+
+  test("pr.verify defaults branch to feat/${taskId} and parent to empty", () => {
+    const snapshot = {
+      runId: "run-1",
+      ...empty,
+      tasks: {
+        t1: {
+          id: "t1",
+          status: "ready-for-review" as TaskStatus,
+          role: "",
+          zone: [],
+        },
+      },
+      phase: "running",
+    }
+    expect(actionsFor(snapshot, autonomous)).toContainEqual({
+      action: "pr.verify",
+      runId: "run-1",
+      taskId: "t1",
+      branch: "feat/t1",
+      parent: "",
+    })
+  })
+
+  test("stored prVerification blocks re-issue; review.start still fires", () => {
+    const snapshot = {
+      runId: "run-1",
+      ...empty,
+      parent: "main",
+      tasks: {
+        t1: {
+          id: "t1",
+          status: "ready-for-review" as TaskStatus,
+          role: "",
+          zone: [],
+          branch: "feat/t1",
+          prVerification: {
+            verified: true,
+            prUrl: "https://example.test/pr/1",
+          },
+        },
+      },
+      phase: "running",
+    }
+    const actions = actionsFor(snapshot, autonomous)
+    expect(actions.some((a) => a.action === "pr.verify")).toBe(false)
+    expect(actions.some((a) => a.action === "review.start")).toBe(true)
+  })
+
+  test("pr.verify runs alongside review.start for the same task", () => {
+    const snapshot = {
+      runId: "run-1",
+      ...empty,
+      parent: "main",
+      tasks: {
+        t1: {
+          id: "t1",
+          status: "ready-for-review" as TaskStatus,
+          role: "implementer",
+          zone: ["packages/brain/src"],
+          branch: "feat/t1",
+        },
+      },
+      phase: "running",
+    }
+    const taskActions = actionsFor(snapshot, autonomous).filter(
+      (a) => a.taskId === "t1",
+    )
+    expect(taskActions.map((a) => a.action)).toEqual([
+      "pr.verify",
+      "review.start",
+    ])
+  })
+
+  test("reviewing tasks without a stored verification still get pr.verify", () => {
+    const snapshot = {
+      runId: "run-1",
+      ...empty,
+      parent: "main",
+      tasks: {
+        t1: {
+          id: "t1",
+          status: "reviewing" as TaskStatus,
+          role: "",
+          zone: [],
+          branch: "feat/t1",
+        },
+      },
+      phase: "running",
+    }
+    expect(actionsFor(snapshot, autonomous)).toEqual([
+      {
+        action: "pr.verify",
+        runId: "run-1",
+        taskId: "t1",
+        branch: "feat/t1",
+        parent: "main",
+      },
+    ])
+  })
+
+  test("no pr.verify for non-ready tasks", () => {
+    const snapshot = {
+      runId: "run-1",
+      ...empty,
+      parent: "main",
+      tasks: {
+        t1: {
+          id: "t1",
+          status: "in-progress" as TaskStatus,
+          role: "",
+          zone: [],
+          branch: "feat/t1",
+        },
+      },
+      phase: "running",
+    }
+    expect(
+      actionsFor(snapshot, autonomous).some((a) => a.action === "pr.verify"),
+    ).toBe(false)
+  })
+})
+
+describe("AgentDO expiry math", () => {
+  const t0 = Date.parse("2026-08-06T00:00:00.000Z")
+
+  test("arm time with no signal → window from now", () => {
+    expect(expiryArmTime(0, 60_000, t0)).toBe(t0 + 60_000)
+  })
+
+  test("arm time anchors on the last signal", () => {
+    expect(expiryArmTime(t0 - 10_000, 60_000, t0)).toBe(t0 + 50_000)
+  })
+
+  test("arm time never goes under 1s in the future", () => {
+    expect(expiryArmTime(t0 - 120_000, 60_000, t0)).toBe(t0 + 1_000)
+  })
+
+  test("expired when the last signal is past the window", () => {
+    expect(expiryExpired(t0 - 61_000, t0, 60_000)).toBe(true)
+    expect(expiryExpired(t0 - 60_000, t0, 60_000)).toBe(true)
+    expect(expiryExpired(t0 - 59_000, t0, 60_000)).toBe(false)
+  })
+
+  test("no signal ever → expired", () => {
+    expect(expiryExpired(0, t0, 60_000)).toBe(true)
+  })
+
+  test("garbage timestamps never expire", () => {
+    expect(expiryExpired(Number.NaN, t0, 60_000)).toBe(false)
   })
 })

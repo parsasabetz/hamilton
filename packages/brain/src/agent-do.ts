@@ -1,7 +1,12 @@
-// Hamilton Brain — AgentDO: per-agent liveness DO with a heartbeat-expiry alarm
-// (HAMILTON.md §5). The alarm is armed on register/heartbeat (now + 5 min) and, on
-// expiry, marks the agent dead in storage and writes the REGISTRY snapshot. It does
-// NOT re-arm itself.
+// Hamilton Brain — AgentDO: per-agent liveness DO with an activity-expiry alarm
+// (HAMILTON.md §5). The alarm fires when NO activity — lastActivityAt or
+// heartbeatAt, whichever is newer — has arrived within the expiry window.
+// armExpiry schedules it; on expiry the agent is marked dead in storage (only
+// when it stayed silent since arming) and the REGISTRY snapshot is written.
+// The alarm does NOT re-arm itself. Hook-level: nothing calls armExpiry yet
+// (M4 wires it); the register/heartbeat endpoints keep arming the legacy beat
+// alarm for compatibility, and the alarm falls back to HEARTBEAT_MS when no
+// armExpiry window has been stored.
 
 import { DurableObject } from "cloudflare:workers"
 
@@ -14,13 +19,45 @@ const KEYS = {
   runId: "runId",
   agentId: "agentId",
   taskId: "taskId",
+  /** Last explicit bridge liveness beat (agent.heartbeat). */
   heartbeatAt: "heartbeatAt",
+  /** Last activity signal — milestones, telemetry, commits (agent.milestone
+   *  and the other activity pokes). The expiry alarm watches this alongside
+   *  heartbeatAt, whichever is newer. */
   lastActivityAt: "lastActivityAt",
   busy: "busy",
   stalledAt: "stalledAt",
+  /** Set once the activity-expiry alarm fires and no activity since arming. */
   diedAt: "diedAt",
+  /** Expiry window armed by the last armExpiry call (fallback HEARTBEAT_MS). */
+  expiryWindowMs: "expiryWindowMs",
   registered: "registered",
 } as const
+
+// Pure expiry math (unit-testable; armExpiry/alarm are the DO wiring).
+//
+// Arm time: with no signal yet, the alarm fires windowMs from now; otherwise
+// windowMs after the last signal, never sooner than 1s out (a stale last
+// signal must not arm an already-overdue alarm).
+export function expiryArmTime(
+  lastSignalMs: number,
+  windowMs: number,
+  nowMs: number,
+): number {
+  if (lastSignalMs <= 0) return nowMs + windowMs
+  return Math.max(lastSignalMs + windowMs, nowMs + 1_000)
+}
+
+// Expired when the last signal is at least windowMs old (or never existed);
+// garbage timestamps never kill an agent.
+export function expiryExpired(
+  lastSignalMs: number,
+  nowMs: number,
+  windowMs: number,
+): boolean {
+  const ageMs = lastSignalMs <= 0 ? windowMs + 1 : nowMs - lastSignalMs
+  return Number.isFinite(ageMs) && ageMs >= windowMs
+}
 
 export class AgentDO extends DurableObject<Env> {
   override async fetch(request: Request): Promise<Response> {
@@ -50,16 +87,47 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   override async alarm(): Promise<void> {
+    await this.ctx.storage.deleteAlarm()
     const { runId, agentId } = await this.identities()
     if (agentId === "") return
-    const heartbeatAt = await this.ctx.storage.get<string>(KEYS.heartbeatAt)
-    const ageMs =
-      heartbeatAt === undefined
-        ? HEARTBEAT_MS + 1
-        : Date.now() - Date.parse(heartbeatAt)
-    if (!Number.isFinite(ageMs) || ageMs <= HEARTBEAT_MS) return
+    const [heartbeatAt, lastActivityAt, expiryWindowMs] = await Promise.all([
+      this.ctx.storage.get<string>(KEYS.heartbeatAt),
+      this.ctx.storage.get<string>(KEYS.lastActivityAt),
+      this.ctx.storage.get<number>(KEYS.expiryWindowMs),
+    ])
+    const lastSignalMs = Math.max(
+      heartbeatAt === undefined ? 0 : Date.parse(heartbeatAt),
+      lastActivityAt === undefined ? 0 : Date.parse(lastActivityAt),
+    )
+    const windowMs = expiryWindowMs ?? HEARTBEAT_MS
+    // Fresh activity since the alarm was armed → the agent is alive; the
+    // fired alarm is dropped (the next arm re-arms from the new signal).
+    if (!expiryExpired(lastSignalMs, Date.now(), windowMs)) return
     await this.ctx.storage.put(KEYS.diedAt, new Date().toISOString())
     await this.writeSnapshot(runId, agentId)
+  }
+
+  // Activity-based expiry arming (M4 hook): the alarm fires windowMs after the
+  // newest of heartbeatAt/lastActivityAt — or windowMs from now when the agent
+  // has no signal yet. The window is persisted so the alarm handler can judge
+  // "no activity since arming" without knowing the caller's window.
+  private async armExpiry(windowMs: number): Promise<void> {
+    const [heartbeatAt, lastActivityAt] = await Promise.all([
+      this.ctx.storage.get<string>(KEYS.heartbeatAt),
+      this.ctx.storage.get<string>(KEYS.lastActivityAt),
+    ])
+    const lastSignalMs = Math.max(
+      heartbeatAt === undefined ? 0 : Date.parse(heartbeatAt),
+      lastActivityAt === undefined ? 0 : Date.parse(lastActivityAt),
+    )
+    await this.ctx.storage.put(KEYS.expiryWindowMs, windowMs)
+    await this.ctx.storage.setAlarm(
+      expiryArmTime(
+        Number.isFinite(lastSignalMs) ? lastSignalMs : 0,
+        windowMs,
+        Date.now(),
+      ),
+    )
   }
 
   private async register(request: Request): Promise<Response> {
