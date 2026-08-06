@@ -7,7 +7,7 @@ import { hamiltonEventTypes } from "@hamilton/shared"
 import type { HamiltonEvent } from "@hamilton/shared"
 
 import { createBridge } from "./bridge.ts"
-import { resolveConfig } from "./config.ts"
+import { loadConfigFile, resolveConfig } from "./config.ts"
 import { createBus } from "./eventbus.ts"
 import type { EmitInput } from "./eventbus.ts"
 import { createBrain } from "./runtime.ts"
@@ -81,7 +81,21 @@ export async function startCore(
   const port = options.port ?? 8787
   const persistDir = options.persistDir ?? ".mf"
   const defaultRunId = options.runId ?? "local-run"
-  const config = resolveConfig(options.config)
+  // Resolution: defaults < hamilton.config.ts (cwd) < explicit overrides.
+  const fileConfig =
+    options.config === undefined
+      ? await loadConfigFile(process.cwd())
+      : undefined
+  const config = resolveConfig({
+    ...fileConfig?.config,
+    ...options.config,
+  })
+  if (fileConfig !== undefined) {
+    logger.info("Config source: {source}{file}", {
+      source: fileConfig.source,
+      file: fileConfig.file ?? "",
+    })
+  }
 
   const brain = await createBrain({ persistDir, config })
   const bus = createBus({ brain, runId: defaultRunId })
