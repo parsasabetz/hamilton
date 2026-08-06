@@ -341,26 +341,25 @@ OpenCode agent files (`.opencode/agents/*.md`, ref: [agents docs](https://openco
 
 ## 11. The orchestration loop
 
-Numbered end-to-end (each step cites its `.agent-state` ancestor):
+Numbered end-to-end (each step cites its `.agent-state` ancestor). **M2 status:** the
+autonomous-execution path (1–5, 10) is implemented and demoed end-to-end; the gate
+(6–9) lands in M3 (_Autonomous governance_).
 
-1. **Plan** — RunDO renders the graph; `run.planned`. (graph.yaml)
-2. **Dispatch unblocked tasks** — all deps `merged`, status `planned` → `in-progress`. (ORCHESTRATOR.md §3.4)
-3. **Provision worktree** — Core: `git worktree add`, branch off parent, install deps. (ORCHESTRATOR.md §2)
-4. **Create session** — role agent + model; register in KV session registry.
-5. **Inject brief + prompt** — `noReply` brief, then run prompt. (briefs/S2)
-6. **Arm claim-deadline alarm** — no `agent.claimed` by deadline → respawn (see §12).
-7. **Supervise** — heartbeats re-arm expiry; milestones append R2 artifacts; `agent.blocked`/questions route to owner board. (§3b protocol)
-8. **On `ready_for_review`** — dispatch N reviewers (default 2) as read-only sessions with diff + contract + check process. (ORCHESTRATOR.md §3.3)
-9. **Three-phase gate** — (a) **READ**: fresh factual subagent — what changed, zone compliance, commit list; (b) **REVIEW**: fresh judgment subagent (Max reasoning) — contract vs code, tests run (writes tests from the objective and runs them), check process green, safety compliance, PR targets parent; (c) **DECIDE**: RunDO weighs READ + REVIEW → `approved` or `rejected` with findings routed back to the task (reject → retry-once, never silent). (ORCHESTRATOR.md §4)
-10. **Merge (owner-gated, D2)** — on `approved`: prepare squash-merge command, request owner confirmation (or execute directly if `mergeAuthority: autonomous`); execute; verify `git log origin/<parent> -1`; flip `merged`; append merge log artifact; re-evaluate DAG for newly unblocked tasks and pre-draft their briefs. (ORCHESTRATOR.md §5)
-11. **Status cadence** — RunDO alarm emits `run.summary` periodically; the dashboard is always current via the same events. (§3a, §3.6)
+1. **Plan** — `hamilton run` (or the conductor, in plan mode) produces a zod-validated task graph; `run.planned` seeds it (`tasks` + `parent`). (graph.yaml)
+2. **Dispatch unblocked tasks** — RunDO `actionsFor`: all deps `merged`, status `planned`, phase ≠ `stopping` → issues `worktree.ensure` over the CORE binding. (ORCHESTRATOR.md §3.4)
+3. **Provision worktree** — Core dispatcher: `git worktree add` off the parent, lockfile-aware install (`provision.install`), emits `worktree.created`, then **chains `session.start`** (task → agent role + model + generated brief). (ORCHESTRATOR.md §2)
+4. **Create session** — role agent + model; KV session registry; brief prompt (`delivery: "queue"`). (briefs/S2)
+5. **Supervise** — composite activity (git changes + commits + tool calls + telemetry within `activity.windowMs`); milestones/commands/violations/reports land in R2; the **worktree watcher** measures drift/diff itself and emits `worktree.status_changed` on any delta (conductor-owned truth, never agent-reported); the permission auto-responder answers `permission.v2.asked` deny-by-default per role. (§3b protocol)
+6. **On `ready_for_review`** — (M2: auto-merge when `mergeAuthority: autonomous`; M3: gate first) → `merge.execute` → squash-merge + verify → `task.merged` → DAG re-evaluation. (ORCHESTRATOR.md §3.3/§5)
+7. **Finish** — all tasks merged → phase `finished`; `hamilton run` reports and exits with the task summary.
+8. **Status cadence** — the dashboard is always current via the same events; the worktree tree graph (SVG) shows drift/diff per branch live. (§3a, §3.6)
 
 ## 12. Failure semantics
 
 | Scenario                   | Detection                                                                                                                             | Recovery                                                                                                                                                                                                       |
 | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Many agents fail**       | RunDO bookkeeping: `failures` per agent; `shouldStop` — failed ≥ `maxFailedAgents` or failed/known ≥ `failedRatio` → phase `stopping` | Dispatch halts (no new planned→in-progress); healthy in-flight agents finish; run reports partial failure                                                                                                      |
-| **Zone violation**         | RunDO: `edit`/`write` tool telemetry with `filePath` outside the task's zone → `agent.zone_violation` + violation log                 | `zoneViolation: record` logs it (default); `warn` surfaces on the dashboard; `block` gates the task (M2)                                                                                                       |
+| **Zone violation**         | RunDO: `edit`/`write` tool telemetry with `filePath` outside the task's zone → `agent.zone_violation` + violation log                 | `zoneViolation: record` logs it (default); `warn` surfaces on the dashboard; `block` gates the task (M3 governance)                                                                                            |
 | **Watched command**        | RunDO: bash tool telemetry matched against `watchCommands` (default `["git"]`) → `agent.command` + command log                        | Recorded per agent — exact audit trail of every `git …` invocation                                                                                                                                             |
 | **Agent never starts**     | `claim-deadline` alarm (AgentDO)                                                                                                      | Respawn: fresh session, same brief, "inspect and continue"                                                                                                                                                     |
 | **Agent dies / quits**     | `heartbeat-expiry` alarm (AgentDO) + bridge stream loss / `agent.stalled`                                                             | Abort session if alive → respawn with continue instruction (never restart from scratch — ORCHESTRATOR.md §7.4)                                                                                                 |

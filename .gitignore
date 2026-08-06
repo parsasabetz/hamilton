@@ -8,3 +8,4 @@ bun.lockb
 .poll.*
 .agent-state
 .turbo
+.worktrees/

@@ -3,6 +3,9 @@
   "version": "0.0.0",
   "private": true,
   "description": "Multi-agent autonomous orchestration framework — see HAMILTON.md",
+  "workspaces": [
+    "packages/*"
+  ],
   "scripts": {
     "dev": "turbo run dev --filter=@hamilton/cli",
     "test": "turbo run test",

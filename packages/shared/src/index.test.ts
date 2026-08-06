@@ -96,7 +96,7 @@ describe("hamiltonConfigSchema", () => {
 })
 
 describe("taskGraphSchema", () => {
-  const validTask = {
+  const graphTask = {
     id: "t1",
     role: "implementer",
     zone: ["packages/core/src"],
@@ -111,7 +111,7 @@ describe("taskGraphSchema", () => {
     expect(taskGraphSchema.safeParse({ tasks: [validTask] }).success).toBe(true)
     expect(
       taskGraphSchema.safeParse({
-        tasks: [validTask, { ...validTask, id: "t2", depends_on: ["t1"] }],
+        tasks: [validTask, { ...graphTask, id: "t2", depends_on: ["t1"] }],
         meta: { prompt: "build an app" },
       }).success,
     ).toBe(true)
@@ -120,7 +120,7 @@ describe("taskGraphSchema", () => {
   test("rejects an empty or invalid graph", () => {
     expect(taskGraphSchema.safeParse({ tasks: [] }).success).toBe(false)
     expect(
-      taskGraphSchema.safeParse({ tasks: [{ ...validTask, depends_on: "t2" }] })
+      taskGraphSchema.safeParse({ tasks: [{ ...graphTask, depends_on: "t2" }] })
         .success,
     ).toBe(false)
   })

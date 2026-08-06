@@ -17,7 +17,9 @@
 | MCP server (`@hamilton/mcp`)                                                               | **100%**   | all 6 tools emit onto the bus via the HTTP shim; checkpoint `phase` selects the event type                                                                                                                                                              |
 | Core server                                                                                | **~75%**   | event bus, `/api/events`, `/api/state`, SSE `/api/stream`, status page; runtime config resolution + CONFIG binding                                                                                                                                      |
 | Brain (Miniflare DOs)                                                                      | **~85%**   | RunDO (dedupe, transitions, snapshots, diff-forwarding, supervision: command watch, zone violations, per-agent R2 logs, early-stop), TaskDO/AgentDO/ReviewDO, queue consumer with leases + exponential-backoff retry; AgentDO liveness alarms next (M4) |
-| Planner / dispatch / gate / merge / recovery                                               | **0%**     | not started                                                                                                                                                                                                                                             |
+| Planner / dispatch / git / sessions / merges                                               | **~90%**   | planner (validation + projection + briefs + LLM decomposition), dispatcher (worktrees/sessions/merges via CORE binding), session registry, permission responder — merge-log artifacts + gate wiring in M3                                               |
+| Worktree graph (live drift/diff in browser)                                                | **done**   | SVG tree graph + worktree table, SSE-live, delta-only status events, git activity attribution                                                                                                                                                           |
+| Composite activity (M2)                                                                    | **done**   | activity = git changes + commits + tool calls + telemetry within `activity.windowMs`; per-agent state + early-stop integration                                                                                                                          |
 | Status page                                                                                | **~60%**   | header/task table/agent table/event tail, SSE live — DAG diagram + detail panels in M2/M5                                                                                                                                                               |
 | M1 demo (`core/src/demo.ts`)                                                               | **done**   | agent → MCP → bus → queue → RunDO → KV → page, incl. restart persistence                                                                                                                                                                                |
 | Conductor session (`hamilton start`)                                                       | **~80%**   | session bootstrap (plan mode, seeded brief, server auto-spawn) — the plan-confirm-execute handoff completes with the dispatcher (M2)                                                                                                                    |
@@ -36,36 +38,31 @@ AgentDO heartbeat-expiry/claim-deadline alarms remain pending until M4 (state ma
 **Effort:** ~1–2 focused sessions. Highest uncertainty in the whole roadmap (in-process
 miniflare queue dispatch + stdio→HTTP shim are first-time integrations).
 
-### M2 — Planner, dispatch, sessions (largest)
+### M2 — Autonomous execution · **complete**
 
-| Task                                                                                                    | Status                                                          |
-| ------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
-| `hamilton run "<prompt>"` CLI command (citty) + run config                                              | not started                                                     |
-| Deterministic planner: prompt + constants → zod-validated graph JSON → `graph.yaml` projection          | not started                                                     |
-| Brief generation (inherits `briefs/S2` format)                                                          | not started                                                     |
-| DAG traversal: gating on `merged`, parallel dispatch, merge-order enforcement                           | not started                                                     |
-| Git provisioning: worktree + branch + deps per task                                                     | not started                                                     |
-| Session lifecycle: create (role+model) → `noReply` brief → `prompt_async` → KV session registry → abort | not started                                                     |
-| Permission auto-responder (deny-by-default, per-role allowlists)                                        | not started                                                     |
-| Agent/session tables + DAG ordering on the page                                                         | not started                                                     |
-| Conductor handoff: `hamilton start` session → confirm plan → invoke the autonomous loop                 | **partial** — session bootstrap shipped; handoff completes here |
-| Early-stop integration: dispatcher honors RunDO phase `stopping`                                        | **partial** — RunDO policy shipped; dispatcher wiring here      |
+Renamed per the governance split (M3 = governance). Everything shipped:
 
-**Exit:** two dependent tasks run in parallel and finish in DAG order.
+- `hamilton run` (prompt → LLM-assisted decomposition, zod-validated; or `--plan` JSON) with graph.yaml projection + run report
+- Dispatcher: worktree.ensure → session.start chaining (mock + real opencode modes), session registry, session.abort, merge.execute (squash + verify + task.merged) — RunDO decides (actionsFor over the CORE service binding), Core executes
+- Composite activity (git changes + commits + tool calls + telemetry within `activity.windowMs`), precise statuses, early-stop integration (phase `stopping` honored by the dispatcher)
+- Worktree watcher: fs.watch + sweep backstop, delta-only `worktree.status_changed` events; branch registry in RunDO; git commits count as agent activity
+- Live worktree tree graph on the status page (SVG, per-parent trees, state colors, drift badges) + worktree table via `/api/worktrees`
+- Permission auto-responder (deny-by-default, per-role policy, v2 permission.reply)
+- **Demo (`demo-m2.ts`):** real DAG (t2 depends on t1) executed end-to-end in a throwaway repo — worktrees, mock sessions, real commits, DAG-ordered squash merges, phase `finished`, live worktree events — all assertions green, offline.
 
-**Effort:** ~3–4 sessions — the planner and the git/session machinery are the bulk.
+**Exit (met):** a real DAG executes end-to-end — plan → graph → worktrees → agents → DAG-ordered merges → live worktree graph, zero human input.
 
-### M3 — Gate & merge
+### M3 — Autonomous governance (reviews, policies, approvals)
 
-| Task                                                                                                            | Status      |
-| --------------------------------------------------------------------------------------------------------------- | ----------- |
-| Reviewer role agent configs (`edit: deny`, restricted bash)                                                     | not started |
-| Reviewer dispatch on `ready_for_review` (N parallel, read-only)                                                 | not started |
-| Review documents → R2; `review.verdict` events                                                                  | not started |
-| Three-phase gate: READ → REVIEW → DECIDE (RunDO)                                                                | not started |
-| Merge executor: squash-merge + verify + status flip + merge-log artifact + DAG re-eval; `mergeAuthority` config | not started |
+| Task                                                                                      | Status      |
+| ----------------------------------------------------------------------------------------- | ----------- |
+| Reviewer role agent configs (`edit: deny`, restricted bash)                               | not started |
+| Reviewer dispatch on `ready_for_review` (N parallel, read-only)                           | not started |
+| Review documents → R2; `review.verdict` events                                            | not started |
+| Three-phase gate: READ → REVIEW → DECIDE (RunDO) replaces the M2 auto-merge trigger       | not started |
+| Richer merge decisions: `mergeAuthority` policies, merge-log artifacts, conflict handling | not started |
 
-**Exit:** a task passes the gate and merges autonomously end-to-end.
+**Exit:** a task passes the gate and merges under policy end-to-end.
 
 **Effort:** ~2 sessions.
 
@@ -95,9 +92,9 @@ miniflare queue dispatch + stdio→HTTP shim are first-time integrations).
 
 ## Where Level 1 is reached
 
-`M1 + M2 + M3 + M4` — M1 is complete; **~7–9 focused sessions remain**
-(M2 the largest at ~3–4, then M3 ~2, M4 ~2), to the "one prompt → finished
-app, zero intervention" goal. M5 can follow or ship incrementally.
+`M1 + M2 + M3 + M4` — M1 and M2 are complete; **~4–6 focused sessions remain**
+(M3 ~2, M4 ~2–3), to the "one prompt → finished app, zero intervention" goal.
+M5 can follow or ship incrementally.
 
 ## Known risks (in build order)
 
