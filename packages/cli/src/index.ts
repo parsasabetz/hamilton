@@ -3,6 +3,7 @@
 import { defineCommand, runMain } from "citty"
 import { startCore } from "@hamilton/core"
 import { startConductor } from "./conductor.ts"
+import { initProject } from "./init.ts"
 
 const main = defineCommand({
   meta: {
@@ -11,6 +12,26 @@ const main = defineCommand({
     description: "Multi-agent autonomous orchestration framework",
   },
   subCommands: {
+    init: defineCommand({
+      meta: {
+        name: "init",
+        description:
+          "Create .hamilton/ (conductor + agent instructions) and hamilton.config.ts",
+      },
+      async run() {
+        const result = initProject(process.cwd())
+        for (const path of result.created) {
+          console.log(`created  ${path}`)
+        }
+        for (const path of result.skipped) {
+          console.log(`skipped  ${path} (already exists)`)
+        }
+        console.log("")
+        console.log(
+          "Hamilton initialized. Edit hamilton.config.ts to tune the run policy.",
+        )
+      },
+    }),
     dev: defineCommand({
       meta: {
         name: "dev",
