@@ -159,6 +159,8 @@ export type CoreAction =
       model?: string
       /** Task zone — the dispatcher's deterministic READ checks diff paths. */
       zone: string[]
+      /** Task contract — reviewers judge against the objective. */
+      contract?: { inputs: string[]; outputs: string[] }
     }
   | {
       action: "review.cleanup"
