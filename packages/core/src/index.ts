@@ -189,9 +189,26 @@ export async function startCore(
     }
   })
 
+  // Reviewer sessions get the read-only "reviewer" permission policy; every
+  // other session (implementers) gets the implementer policy. The set is fed
+  // from review.assigned events (mock and real sessions alike).
+  const reviewerSessions = new Set<string>()
+  bus.subscribe((event) => {
+    if (event.type === "review.assigned" && isRecord(event.payload)) {
+      const reviewers = event.payload["reviewers"]
+      if (Array.isArray(reviewers)) {
+        for (const reviewer of reviewers) {
+          if (isRecord(reviewer) && typeof reviewer["sessionId"] === "string") {
+            reviewerSessions.add(reviewer["sessionId"])
+          }
+        }
+      }
+    }
+  })
   const responder = createPermissionResponder({
     controlPlane,
-    roleForSession: () => "implementer",
+    roleForSession: (sessionId) =>
+      reviewerSessions.has(sessionId) ? "reviewer" : "implementer",
   })
   bus.subscribe((event) => {
     void responder.handleTelemetry(event)

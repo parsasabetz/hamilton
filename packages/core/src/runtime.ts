@@ -36,6 +36,8 @@ export interface BrainHandle {
   nextSeq(runId: string): Promise<number>
   registryGet(key: string): Promise<string | null>
   registryPut(key: string, value: string): Promise<void>
+  registryList(prefix: string): Promise<string[]>
+  registryDelete(key: string): Promise<void>
   setCoreHandler(handler: (request: Request) => Promise<Response>): void
   dispose(): Promise<void>
   mf: Miniflare
@@ -173,6 +175,27 @@ export async function createBrain(options: BrainOptions): Promise<BrainHandle> {
     },
     async registryPut(key: string, value: string): Promise<void> {
       await registry.put(key, value)
+    },
+    async registryList(prefix: string): Promise<string[]> {
+      const keys: string[] = []
+      let done = false
+      let cursor: string | undefined
+      while (!done) {
+        const page = await registry.list({
+          prefix,
+          ...(cursor !== undefined ? { cursor } : {}),
+        })
+        for (const key of page.keys) keys.push(key.name)
+        if (page.list_complete) {
+          done = true
+        } else {
+          cursor = page.cursor
+        }
+      }
+      return keys
+    },
+    async registryDelete(key: string): Promise<void> {
+      await registry.delete(key)
     },
     setCoreHandler(handler: (request: Request) => Promise<Response>): void {
       coreHandlerRef.current = handler
