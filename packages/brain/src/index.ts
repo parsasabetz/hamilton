@@ -1,45 +1,55 @@
-// Hamilton Brain — Miniflare/Workers code (HAMILTON.md §5).
-// v0.0: RunDO skeleton with alarm pattern; worker entry dispatching to the DO.
+// Hamilton Brain — worker entry (HAMILTON.md §5).
+// Routes /ping, /do/run, and the event bus queue into the RunDO spine.
 
-import { DurableObject } from "cloudflare:workers"
+import type { AgentDO } from "./agent-do.ts"
+import { isHamiltonEvent } from "./run-do.ts"
+import type { RunDO } from "./run-do.ts"
+import type { ReviewDO } from "./review-do.ts"
+import type { TaskDO } from "./task-do.ts"
+
+export { AgentDO } from "./agent-do.ts"
+export { ReviewDO } from "./review-do.ts"
+export { RunDO } from "./run-do.ts"
+export { TaskDO } from "./task-do.ts"
 
 export interface Env {
   RUN_DO: DurableObjectNamespace<RunDO>
-}
-
-const ALARM_MS = 60_000
-
-export class RunDO extends DurableObject<Env> {
-  override async fetch(request: Request): Promise<Response> {
-    const url = new URL(request.url)
-    if (url.pathname === "/state") {
-      return Response.json({
-        phase: "planned",
-        tasks: [],
-        lastAlarm: await this.ctx.storage.get("lastAlarm"),
-      })
-    }
-    return new Response("not found", { status: 404 })
-  }
-
-  override async alarm(): Promise<void> {
-    // Alarms do not repeat — re-arm the next one (HAMILTON.md §5).
-    await this.ctx.storage.put("lastAlarm", Date.now())
-    await this.ctx.storage.setAlarm(Date.now() + ALARM_MS)
-  }
-
-  async armAlarm(delayMs: number = ALARM_MS): Promise<void> {
-    await this.ctx.storage.setAlarm(Date.now() + delayMs)
-  }
+  TASK_DO: DurableObjectNamespace<TaskDO>
+  AGENT_DO: DurableObjectNamespace<AgentDO>
+  REVIEW_DO: DurableObjectNamespace<ReviewDO>
+  EVENTS: KVNamespace
+  REGISTRY: KVNamespace
+  ARTIFACTS: R2Bucket
+  BUS: Queue<unknown>
 }
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url)
+    if (url.pathname === "/ping") {
+      return new Response("ok")
+    }
     if (url.pathname.startsWith("/do/run")) {
       const id = env.RUN_DO.idFromName("run:default")
       return env.RUN_DO.get(id).fetch(request)
     }
-    return new Response("hamilton brain ok", { status: 200 })
+    return new Response("not found", { status: 404 })
+  },
+
+  async queue(batch: MessageBatch<unknown>, env: Env): Promise<void> {
+    await Promise.all(
+      batch.messages.map((message) => {
+        const evt = message.body
+        if (!isHamiltonEvent(evt)) return Promise.resolve()
+        const id = env.RUN_DO.idFromName(`run:${evt.runId}`)
+        return env.RUN_DO.get(id)
+          .fetch("http://do/event", {
+            method: "POST",
+            body: JSON.stringify(evt),
+            headers: { "content-type": "application/json" },
+          })
+          .then(() => {})
+      }),
+    )
   },
 } satisfies ExportedHandler<Env>
