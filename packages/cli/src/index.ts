@@ -23,8 +23,10 @@ const main = defineCommand({
         },
       },
       async run({ args }) {
-        const handle = startCore({ port: Number(args.port ?? "8787") })
-        const shutdown = (): void => handle.stop()
+        const handle = await startCore({ port: Number(args.port ?? "8787") })
+        const shutdown = (): void => {
+          void handle.stop()
+        }
         process.on("SIGINT", shutdown)
         process.on("SIGTERM", shutdown)
       },
