@@ -8,11 +8,17 @@ import type { BusHandle, EmitInput } from "./eventbus.ts"
 import { parentHead } from "./git.ts"
 import type { ControlPlane } from "./opencode.ts"
 import {
+  buildReviewBrief,
+  checkZoneCompliance,
+  computeReadFacts,
   createDispatcher,
   createPermissionResponder,
   decidePermission,
   extractPermissionRequest,
+  renderReadSummary,
+  reviewWorktreePathFor,
 } from "./dispatch.ts"
+import type { ReadFacts } from "./dispatch.ts"
 import type { DispatcherBrain } from "./dispatch.ts"
 
 const cleanup: string[] = []
@@ -69,6 +75,12 @@ function stubBrain(): {
     },
     async registryPut(key: string, value: string): Promise<void> {
       registry.set(key, value)
+    },
+    async registryList(prefix: string): Promise<string[]> {
+      return [...registry.keys()].filter((key) => key.startsWith(prefix))
+    },
+    async registryDelete(key: string): Promise<void> {
+      registry.delete(key)
     },
   } as unknown as DispatcherBrain
   return { brain, registry }
@@ -260,6 +272,51 @@ describe("createDispatcher — session actions (mock mode)", () => {
     })
     expect(result).toEqual({ ok: false, error: "no session registered" })
   })
+
+  test("session.nudge returns ok without a registered session", async () => {
+    const { bus } = stubBus()
+    const { brain } = stubBrain()
+    const dispatcher = createDispatcher({
+      runId: "run-1",
+      repoRoot: "/tmp/unused",
+      worktreesDir: ".worktrees",
+      parent: "main",
+      config: hamiltonConfigSchema.parse({}),
+      bus,
+      brain,
+      controlPlane: undefined,
+    })
+    const result = await dispatcher.handleAction({
+      action: "session.nudge",
+      runId: "run-1",
+      taskId: "t1",
+      message: "please continue",
+    })
+    expect(result).toEqual({ ok: true })
+  })
+
+  test("session.nudge returns ok with a registered mock session", async () => {
+    const { bus } = stubBus()
+    const { brain, registry } = stubBrain()
+    registry.set("session:run-1:t1", "mock-t1")
+    const dispatcher = createDispatcher({
+      runId: "run-1",
+      repoRoot: "/tmp/unused",
+      worktreesDir: ".worktrees",
+      parent: "main",
+      config: hamiltonConfigSchema.parse({}),
+      bus,
+      brain,
+      controlPlane: undefined,
+    })
+    const result = await dispatcher.handleAction({
+      action: "session.nudge",
+      runId: "run-1",
+      taskId: "t1",
+      message: "please continue",
+    })
+    expect(result).toEqual({ ok: true })
+  })
 })
 
 describe("createDispatcher — git actions (real repo)", () => {
@@ -340,6 +397,263 @@ describe("createDispatcher — git actions (real repo)", () => {
     const merged = events.find((event) => event.type === "task.merged")
     expect(merged?.payload).toEqual({ commit: result.mergeCommit })
     expect(events.some((event) => event.type === "worktree.created")).toBe(true)
+  })
+})
+
+describe("checkZoneCompliance", () => {
+  test("flags out-of-zone files and passes in-zone files", () => {
+    const changed = [
+      "src/a.ts",
+      "src/lib/b.ts",
+      "./src/c.ts",
+      "docs/readme.md",
+      "./docs/guide.md",
+    ]
+    expect(checkZoneCompliance(changed, ["src"])).toEqual([
+      "docs/readme.md",
+      "./docs/guide.md",
+    ])
+    expect(checkZoneCompliance(changed, ["src", "docs"])).toEqual([])
+  })
+
+  test("an empty zone never flags anything", () => {
+    expect(checkZoneCompliance(["src/a.ts", "docs/readme.md"], [])).toEqual([])
+  })
+})
+
+describe("computeReadFacts", () => {
+  test("reads diff stat, changed files, and commits from a real repo", () => {
+    const { repoRoot, worktreesDir } = makeRepo()
+    run(["checkout", "-b", "feat/t1"], repoRoot)
+    writeFileSync(join(repoRoot, "f1.txt"), "f1\n")
+    run(["add", "f1.txt"], repoRoot)
+    run(["commit", "-m", "one"], repoRoot)
+    writeFileSync(join(repoRoot, "f2.txt"), "f2\n")
+    run(["add", "f2.txt"], repoRoot)
+    run(["commit", "-m", "two"], repoRoot)
+
+    const facts = computeReadFacts(
+      { repoRoot, worktreesDir },
+      "feat/t1",
+      "parent",
+    )
+    expect(facts.diffStat).toContain("f1.txt")
+    expect(facts.changedFiles).toEqual(["f1.txt", "f2.txt"])
+    expect(facts.commits).toHaveLength(2)
+    expect(facts.commits[0]).toContain("two")
+  })
+
+  test("returns empty facts for a missing branch, never throws", () => {
+    const { repoRoot, worktreesDir } = makeRepo()
+    const facts = computeReadFacts(
+      { repoRoot, worktreesDir },
+      "feat/nope",
+      "parent",
+    )
+    expect(facts.diffStat).toBe("")
+    expect(facts.changedFiles).toEqual([])
+    expect(facts.commits).toEqual([])
+  })
+})
+
+describe("buildReviewBrief", () => {
+  test("is deterministic and includes role, task, zone, and READ summary", () => {
+    const facts: ReadFacts = {
+      diffStat: "src/a.ts | 3 ++-",
+      changedFiles: ["src/a.ts"],
+      commits: ["abc1230 feat: change a"],
+      zoneViolations: [],
+    }
+    const readSummary = renderReadSummary(facts, ["src", "tests"])
+    const brief = buildReviewBrief({
+      taskId: "t1",
+      branch: "feat/t1",
+      parent: "parent",
+      role: "security",
+      worktreePath: "/tmp/repo/.worktrees/review-t1",
+      zone: ["src", "tests"],
+      instructions: "You are a **reviewer**. Check the diff. Never edit.",
+      readSummary,
+    })
+    expect(brief).toContain("You are the security reviewer for task t1")
+    expect(brief).toContain(
+      "You are a **reviewer**. Check the diff. Never edit.",
+    )
+    expect(brief).toContain("- branch: feat/t1")
+    expect(brief).toContain("- parent: parent")
+    expect(brief).toContain("- worktree: /tmp/repo/.worktrees/review-t1")
+    expect(brief).toContain("- zone: src, tests")
+    expect(brief).toContain("## READ (deterministic facts)")
+    expect(brief).toContain("src/a.ts")
+    expect(brief).toContain("abc1230 feat: change a")
+    expect(brief).toContain("submit_review")
+  })
+})
+
+describe("createDispatcher — review actions (real repo)", () => {
+  test("review.start provisions a detached worktree and assigns reviewers", async () => {
+    const { repoRoot, worktreesDir } = makeRepo()
+    run(["checkout", "-b", "feat/t1"], repoRoot)
+    writeFileSync(join(repoRoot, "feature.txt"), "feature\n")
+    run(["add", "feature.txt"], repoRoot)
+    run(["commit", "-m", "feature work"], repoRoot)
+    const branchTip = run(["rev-parse", "feat/t1"], repoRoot).stdout
+
+    const { bus, events } = stubBus()
+    const { brain, registry } = stubBrain()
+    const dispatcher = createDispatcher({
+      runId: "run-1",
+      repoRoot,
+      worktreesDir,
+      parent: "parent",
+      config: skipInstallConfig(),
+      bus,
+      brain,
+      controlPlane: undefined,
+    })
+    const result = await dispatcher.handleAction({
+      action: "review.start",
+      runId: "run-1",
+      taskId: "t1",
+      branch: "feat/t1",
+      parent: "parent",
+      roles: ["correctness", "security"],
+      zone: ["src"],
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok) throw new Error(result.error)
+    expect(result.reviewerSessionIds).toEqual([
+      "mock-review-t1-0",
+      "mock-review-t1-1",
+    ])
+    expect(result.reviewWorktreePath).toBe(
+      join(repoRoot, ".worktrees", "review-t1"),
+    )
+    expect(run(["worktree", "list", "--porcelain"], repoRoot).stdout).toContain(
+      join(repoRoot, ".worktrees", "review-t1"),
+    )
+    expect(
+      run(["rev-parse", "HEAD"], join(repoRoot, ".worktrees", "review-t1"))
+        .stdout,
+    ).toBe(branchTip)
+
+    const assigned = events.find((event) => event.type === "review.assigned")
+    expect(assigned?.taskId).toBe("t1")
+    expect(assigned?.payload).toEqual({
+      taskId: "t1",
+      reviewers: [
+        { idx: 0, role: "correctness", sessionId: "mock-review-t1-0" },
+        { idx: 1, role: "security", sessionId: "mock-review-t1-1" },
+      ],
+      worktreePath: join(repoRoot, ".worktrees", "review-t1"),
+    })
+    expect(registry.get("review:run-1:t1:0")).toBe("mock-review-t1-0")
+    expect(registry.get("review:run-1:t1:1")).toBe("mock-review-t1-1")
+  })
+
+  test("review.start reuses an existing review worktree on re-run", async () => {
+    const { repoRoot, worktreesDir } = makeRepo()
+    run(["checkout", "-b", "feat/t1"], repoRoot)
+    writeFileSync(join(repoRoot, "feature.txt"), "feature\n")
+    run(["add", "feature.txt"], repoRoot)
+    run(["commit", "-m", "feature work"], repoRoot)
+
+    const { bus } = stubBus()
+    const { brain } = stubBrain()
+    const dispatcher = createDispatcher({
+      runId: "run-1",
+      repoRoot,
+      worktreesDir,
+      parent: "parent",
+      config: skipInstallConfig(),
+      bus,
+      brain,
+      controlPlane: undefined,
+    })
+    const action = {
+      action: "review.start",
+      runId: "run-1",
+      taskId: "t1",
+      branch: "feat/t1",
+      parent: "parent",
+      roles: ["correctness"],
+      zone: [],
+    } satisfies import("@hamilton/shared").CoreAction
+    const first = await dispatcher.handleAction(action)
+    const second = await dispatcher.handleAction(action)
+    expect(first.ok).toBe(true)
+    expect(second.ok).toBe(true)
+    const listing = run(["worktree", "list", "--porcelain"], repoRoot).stdout
+    const matches = listing
+      .split("\n")
+      .filter((line) => line.includes("review-t1"))
+    expect(matches).toHaveLength(1)
+  })
+
+  test("review.cleanup removes the worktree and registry keys", async () => {
+    const { repoRoot, worktreesDir } = makeRepo()
+    run(["checkout", "-b", "feat/t1"], repoRoot)
+    writeFileSync(join(repoRoot, "feature.txt"), "feature\n")
+    run(["add", "feature.txt"], repoRoot)
+    run(["commit", "-m", "feature work"], repoRoot)
+
+    const { bus } = stubBus()
+    const { brain, registry } = stubBrain()
+    const dispatcher = createDispatcher({
+      runId: "run-1",
+      repoRoot,
+      worktreesDir,
+      parent: "parent",
+      config: skipInstallConfig(),
+      bus,
+      brain,
+      controlPlane: undefined,
+    })
+    const started = await dispatcher.handleAction({
+      action: "review.start",
+      runId: "run-1",
+      taskId: "t1",
+      branch: "feat/t1",
+      parent: "parent",
+      roles: ["correctness"],
+      zone: [],
+    })
+    expect(started.ok).toBe(true)
+    const result = await dispatcher.handleAction({
+      action: "review.cleanup",
+      runId: "run-1",
+      taskId: "t1",
+    })
+    expect(result).toEqual({ ok: true })
+    expect(
+      run(["worktree", "list", "--porcelain"], repoRoot).stdout,
+    ).not.toContain("review-t1")
+    expect(registry.get("review:run-1:t1:0")).toBeUndefined()
+  })
+
+  test("review.cleanup returns ok when no worktree exists", async () => {
+    const { repoRoot, worktreesDir } = makeRepo()
+    const { bus } = stubBus()
+    const { brain } = stubBrain()
+    const dispatcher = createDispatcher({
+      runId: "run-1",
+      repoRoot,
+      worktreesDir,
+      parent: "parent",
+      config: skipInstallConfig(),
+      bus,
+      brain,
+      controlPlane: undefined,
+    })
+    const result = await dispatcher.handleAction({
+      action: "review.cleanup",
+      runId: "run-1",
+      taskId: "t1",
+    })
+    expect(result).toEqual({ ok: true })
+    expect(reviewWorktreePathFor({ repoRoot, worktreesDir }, "t1")).toBe(
+      join(repoRoot, ".worktrees", "review-t1"),
+    )
   })
 })
 

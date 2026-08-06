@@ -259,3 +259,19 @@ describe("installIfLockfile", () => {
     expect(installIfLockfile(dir)).toEqual({ command: null, ok: false })
   })
 })
+
+describe("squashMerge idempotency (M3)", () => {
+  test("a re-issued merge after a successful squash is nothing-to-merge", () => {
+    const { options, repo } = makeRepo()
+    createWorktree(options, "parent", "feat/t1")
+    const wt = worktreePathFor(options, "feat/t1")
+    commitIn(wt, "t1.txt", "t1")
+    squashMerge(options, "feat/t1", "parent", "merge(t1)")
+    // The parent now carries the changes: a re-issued merge must not stage
+    // nothing and fail at commit — it must be detected as already merged.
+    expect(() =>
+      squashMerge(options, "feat/t1", "parent", "merge(t1) again"),
+    ).toThrow("nothing to merge")
+    expect(realpathSync(repo)).toBeTruthy()
+  })
+})

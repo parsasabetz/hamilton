@@ -320,6 +320,19 @@ export function squashMerge(
   if (aheadRes.exitCode !== 0 || countOf(aheadRes) === 0) {
     throw new Error("nothing to merge")
   }
+  // Squash commits are not ancestors: after a squash, `parent..branch` still
+  // counts the branch's commits, so a re-issued merge would stage nothing and
+  // fail at commit. Detect "changes already in the parent" via the two-dot
+  // diff — empty means the merge is effectively done.
+  const alreadyRes = gitRun(options.repoRoot, [
+    "diff",
+    "--quiet",
+    parent,
+    branch,
+  ])
+  if (alreadyRes.exitCode === 0) {
+    throw new Error("nothing to merge")
+  }
 
   const mergeDir = worktreePathForBranch(options, parent) ?? options.repoRoot
   const mergeRes = gitRun(mergeDir, ["merge", "--squash", branch])
