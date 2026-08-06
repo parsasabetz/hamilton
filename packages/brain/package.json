@@ -7,9 +7,12 @@
     ".": "./src/index.ts"
   },
   "scripts": {
+    "test": "bun test src",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^5.20260804.1"
+    "@cloudflare/workers-types": "^5.20260804.1",
+    "@hamilton/shared": "workspace:*",
+    "@types/bun": "^1.3.14"
   }
 }

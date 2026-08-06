@@ -16,6 +16,7 @@
     "@hamilton/shared": "workspace:*",
     "@logtape/logtape": "^2.3.0",
     "@opencode-ai/sdk": "^1.18.14",
+    "esbuild": "^0.28.1",
     "miniflare": "^4.20260730.0"
   },
   "devDependencies": {
