@@ -13,47 +13,51 @@ export interface HamiltonEvent {
   payload: unknown
 }
 
-// HAMILTON.md §4.3 — the full event type table.
+// HAMILTON.md §4.3 — the full event type table (runtime array + derived type,
+// so validators and the Core's /api/events endpoint share one source).
 
-export type EventType =
+export const hamiltonEventTypes = [
   // agent domain
-  | "agent.claimed"
-  | "agent.started"
-  | "agent.milestone"
-  | "agent.heartbeat"
-  | "agent.error"
-  | "agent.blocked"
-  | "agent.ready_for_review"
-  | "agent.subagent_spawned"
-  | "agent.subagent_result"
-  | "agent.died"
+  "agent.claimed",
+  "agent.started",
+  "agent.milestone",
+  "agent.heartbeat",
+  "agent.error",
+  "agent.blocked",
+  "agent.ready_for_review",
+  "agent.subagent_spawned",
+  "agent.subagent_result",
+  "agent.died",
   // agent domain — bridge-derived liveness (from the OpenCode SSE stream)
-  | "agent.stalled"
-  | "agent.idle"
+  "agent.stalled",
+  "agent.idle",
   // review domain
-  | "review.assigned"
-  | "review.started"
-  | "review.submitted"
-  | "review.verdict"
+  "review.assigned",
+  "review.started",
+  "review.submitted",
+  "review.verdict",
   // task domain
-  | "task.dispatched"
-  | "task.status_changed"
-  | "task.merged"
-  | "task.escalated"
-  | "task.blocked"
+  "task.dispatched",
+  "task.status_changed",
+  "task.merged",
+  "task.escalated",
+  "task.blocked",
   // run domain
-  | "run.planned"
-  | "run.pause"
-  | "run.resume"
-  | "run.finish"
+  "run.planned",
+  "run.pause",
+  "run.resume",
+  "run.finish",
   // telemetry domain — raw OpenCode stream passthrough (bridge)
-  | "telemetry.opencode"
-  | "telemetry.stream_lost"
-  | "telemetry.stream_reconnected"
+  "telemetry.opencode",
+  "telemetry.stream_lost",
+  "telemetry.stream_reconnected",
   // system domain
-  | "budget.exceeded"
-  | "owner.action"
-  | "system.error"
+  "budget.exceeded",
+  "owner.action",
+  "system.error",
+] as const
+
+export type EventType = (typeof hamiltonEventTypes)[number]
 
 // HAMILTON.md §9.1 — the authoritative task schema.
 
