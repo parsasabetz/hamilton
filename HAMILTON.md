@@ -341,18 +341,23 @@ OpenCode agent files (`.opencode/agents/*.md`, ref: [agents docs](https://openco
 
 ## 11. The orchestration loop
 
-Numbered end-to-end (each step cites its `.agent-state` ancestor). **M2 status:** the
-autonomous-execution path (1–5, 10) is implemented and demoed end-to-end; the gate
-(6–9) lands in M3 (_Autonomous governance_).
+Numbered end-to-end (each step cites its `.agent-state` ancestor). **M3 status:** the
+gate (6–8) is live — M2's auto-merge was replaced by review.start → reviewer
+submissions → DECIDE → merge/nudge. Reviews are **role-weighted**: `review.roles`
+dispatch one read-only session per role, `review.vetoRoles` (default `["*"]` = all)
+control who can veto; findings are structured (`id`, `location`, `issue`,
+`suggested_fix`) and route back to the agent on rejection.
 
 1. **Plan** — `hamilton run` (or the conductor, in plan mode) produces a zod-validated task graph; `run.planned` seeds it (`tasks` + `parent`). (graph.yaml)
 2. **Dispatch unblocked tasks** — RunDO `actionsFor`: all deps `merged`, status `planned`, phase ≠ `stopping` → issues `worktree.ensure` over the CORE binding. (ORCHESTRATOR.md §3.4)
 3. **Provision worktree** — Core dispatcher: `git worktree add` off the parent, lockfile-aware install (`provision.install`), emits `worktree.created`, then **chains `session.start`** (task → agent role + model + generated brief). (ORCHESTRATOR.md §2)
 4. **Create session** — role agent + model; KV session registry; brief prompt (`delivery: "queue"`). (briefs/S2)
 5. **Supervise** — composite activity (git changes + commits + tool calls + telemetry within `activity.windowMs`); milestones/commands/violations/reports land in R2; the **worktree watcher** measures drift/diff itself and emits `worktree.status_changed` on any delta (conductor-owned truth, never agent-reported); the permission auto-responder answers `permission.v2.asked` deny-by-default per role. (§3b protocol)
-6. **On `ready_for_review`** — (M2: auto-merge when `mergeAuthority: autonomous`; M3: gate first) → `merge.execute` → squash-merge + verify → `task.merged` → DAG re-evaluation. (ORCHESTRATOR.md §3.3/§5)
-7. **Finish** — all tasks merged → phase `finished`; `hamilton run` reports and exits with the task summary.
-8. **Status cadence** — the dashboard is always current via the same events; the worktree tree graph (SVG) shows drift/diff per branch live. (§3a, §3.6)
+6. **On `ready_for_review`** — RunDO issues `review.start`: the dispatcher provisions a **detached review worktree** at the branch tip, computes the deterministic **READ** (diff stat, changed files, zone compliance, commits) and starts one reviewer session per `review.roles` with the READ summary + contract + `.hamilton/reviewer-agent.md` instructions.
+7. **Reviewers submit** — each files `review.submitted` (structured findings + verdict + checksRun/testsWritten) via the `submit_review` MCP tool; RunDO stores the review document to R2. When all reviewers have voted: **DECIDE** (`decideGate`) — any **veto-role** fail rejects; all findings route to the agent via `session.nudge`; the synthesized `review.verdict` loops back through the bus (shared seq counter, so the log stays collision-free).
+8. **Reject → fix → re-review** — task returns to `in-progress`, `reviewRetries`++; the agent fixes and re-readies → a **fresh gate** round (reviewers cleared, issued-markers dropped); past `review.maxRetries` → task `blocked`. `approved` + `mergeAuthority: autonomous` → `merge.execute` (idempotent: an already-squashed re-merge emits `task.merged` with `alreadyMerged` instead of looping) → squash-merge + verify → `task.merged` → `review.cleanup` → DAG re-evaluation. (ORCHESTRATOR.md §3.3/§4/§5)
+9. **Finish** — all tasks merged → phase `finished`; `hamilton run` reports and exits with the task summary.
+10. **Status cadence** — the dashboard is always current via the same events; the worktree tree graph (SVG) shows drift/diff per branch live. (§3a, §3.6)
 
 ## 12. Failure semantics
 

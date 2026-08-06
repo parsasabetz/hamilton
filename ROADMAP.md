@@ -52,19 +52,30 @@ Renamed per the governance split (M3 = governance). Everything shipped:
 
 **Exit (met):** a real DAG executes end-to-end — plan → graph → worktrees → agents → DAG-ordered merges → live worktree graph, zero human input.
 
-### M3 — Autonomous governance (reviews, policies, approvals)
+### M3 — Autonomous governance · **complete**
 
-| Task                                                                                      | Status      |
-| ----------------------------------------------------------------------------------------- | ----------- |
-| Reviewer role agent configs (`edit: deny`, restricted bash)                               | not started |
-| Reviewer dispatch on `ready_for_review` (N parallel, read-only)                           | not started |
-| Review documents → R2; `review.verdict` events                                            | not started |
-| Three-phase gate: READ → REVIEW → DECIDE (RunDO) replaces the M2 auto-merge trigger       | not started |
-| Richer merge decisions: `mergeAuthority` policies, merge-log artifacts, conflict handling | not started |
+All governance pieces shipped:
 
-**Exit:** a task passes the gate and merges under policy end-to-end.
+- Reviewers: `.hamilton/reviewer-agent.md` (tweakable constants; validated by
+  `hamilton start`/`run` along with every file in `.hamilton/`), detached
+  review worktrees at the branch tip, one read-only session per `review.roles`
+- Deterministic READ (diff stat, changed files, zone compliance, commits)
+  packaged into each review brief with the task contract + instructions
+- `submit_review` MCP tool: structured findings (id/location/issue/suggested_fix)
+  - checksRun/testsWritten/verdict; review documents stored in R2
+- DECIDE (`decideGate`): role-weighted vetoes (`review.vetoRoles`, ["*"] =
+  fail-closed); rejection routes findings back via `session.nudge`; retries
+  capped by `review.maxRetries` → blocked; fresh gate rounds after fixes
+- Synthesized `review.verdict` events loop through the bus from the shared seq
+  counter (collision-free log); merge.execute is now idempotent
+  (already-squashed re-merges emit task.merged with alreadyMerged — no loops)
+- **Demo (`demo-m3.ts`):** full governance loop offline — t1 rejected with
+  SEC-001 findings, agent fixes, fresh gate passes, both tasks merge in DAG
+  order, 3 verdicts + 6 submissions live on the bus — 12/12 assertions green
 
-**Effort:** ~2 sessions.
+**Exit (met):** a task is rejected with findings, fixed, re-reviewed, and merges under policy, end-to-end.
+
+**Effort:** shipped in one focused pass (~3 parallel subagents + integration).
 
 ### M4 — Failure semantics & guardrails
 
@@ -92,8 +103,8 @@ Renamed per the governance split (M3 = governance). Everything shipped:
 
 ## Where Level 1 is reached
 
-`M1 + M2 + M3 + M4` — M1 and M2 are complete; **~4–6 focused sessions remain**
-(M3 ~2, M4 ~2–3), to the "one prompt → finished app, zero intervention" goal.
+`M1 + M2 + M3 + M4` — M1–M3 are complete; **~2–3 focused sessions remain**
+(M4), to the "one prompt → finished app, zero intervention" goal.
 M5 can follow or ship incrementally.
 
 ## Known risks (in build order)
