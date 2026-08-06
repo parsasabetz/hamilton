@@ -10,8 +10,32 @@
 import type { HamiltonEvent } from "@hamilton/shared"
 
 const PAYLOAD_BRIEF_LENGTH = 120
+const DOING_MESSAGE_LENGTH = 60
 
-/** "12s ago" / "3m ago" / "—" — heartbeat age at a given wall clock. */
+/** One agent row from the /api/state snapshot's agents array. */
+export interface AgentState {
+  agentId: string
+  taskId?: string
+  state: string
+  status?: string
+  lastPhase?: string
+  lastReportAt?: string
+  lastMessage?: string
+  lastFiles?: string[]
+  claimedAt?: string
+  startedAt?: string
+  errorCount?: number
+  subagentCount?: number
+  lastSubagentRole?: string
+  lastReadyAt?: string
+  heartbeatAt?: string
+  lastActivityAt?: string
+  busy?: boolean
+  stalledAt?: string
+  diedAt?: string
+}
+
+/** "12s ago" / "3m ago" / "—" — age of a single ISO timestamp at a wall clock. */
 export function formatHeartbeatAge(
   heartbeatAt: string | undefined,
   nowMs: number,
@@ -22,6 +46,94 @@ export function formatHeartbeatAge(
   const seconds = Math.max(0, Math.floor((nowMs - atMs) / 1000))
   if (seconds < 60) return `${seconds}s ago`
   return `${Math.floor(seconds / 60)}m ago`
+}
+
+/** Same as formatHeartbeatAge — activity age of one timestamp. */
+export function formatActivityAge(
+  at: string | undefined,
+  nowMs: number,
+): string {
+  return formatHeartbeatAge(at, nowMs)
+}
+
+/** Newest of activity/heartbeat/report timestamps, or undefined. */
+function newestActivityAt(agent: AgentState): string | undefined {
+  let newest: string | undefined
+  for (const ts of [
+    agent.lastActivityAt,
+    agent.heartbeatAt,
+    agent.lastReportAt,
+  ]) {
+    if (!ts) continue
+    const atMs = Date.parse(ts)
+    if (Number.isNaN(atMs)) continue
+    if (!newest || atMs > Date.parse(newest)) newest = ts
+  }
+  return newest
+}
+
+/** "12s ago" / "3m ago" / "—" — age of the newest activity signal. */
+export function activityAge(agent: AgentState, nowMs: number): string {
+  return formatActivityAge(newestActivityAt(agent), nowMs)
+}
+
+/** "working · phase — message…" — what the agent is doing right now. */
+export function doingText(agent: AgentState): string {
+  if (agent.lastPhase && agent.lastMessage) {
+    const message =
+      agent.lastMessage.length > DOING_MESSAGE_LENGTH
+        ? `${agent.lastMessage.slice(0, DOING_MESSAGE_LENGTH)}…`
+        : agent.lastMessage
+    return `${agent.status ?? "working"} · ${agent.lastPhase} — ${message}`
+  }
+  if (agent.lastPhase) return agent.lastPhase
+  return "—"
+}
+
+/** Present protocol badges: claim/start/ready, plus err:N and sub:N counts. */
+export function protocolBadges(agent: AgentState): string[] {
+  const badges: string[] = []
+  if (agent.claimedAt) badges.push("claim")
+  if (agent.startedAt) badges.push("start")
+  if (agent.lastReadyAt) badges.push("ready")
+  if (agent.errorCount && agent.errorCount > 0)
+    badges.push(`err:${agent.errorCount}`)
+  if (agent.subagentCount && agent.subagentCount > 0) {
+    badges.push(`sub:${agent.subagentCount}`)
+  }
+  return badges
+}
+
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+}
+
+const PROTOCOL_STEPS: ReadonlyArray<{
+  label: string
+  present: (agent: AgentState) => boolean
+}> = [
+  { label: "claim", present: (agent) => !!agent.claimedAt },
+  { label: "start", present: (agent) => !!agent.startedAt },
+  { label: "ready", present: (agent) => !!agent.lastReadyAt },
+]
+
+/** The doing cell innerHTML: escaped doing text + protocol/count badges. */
+export function doingRow(agent: AgentState): string {
+  let html = escapeHtml(doingText(agent))
+  for (const step of PROTOCOL_STEPS) {
+    html += `<span class="badge ${step.present(agent) ? "st-ok" : "st-bad"}">${step.label}</span>`
+  }
+  if (agent.errorCount && agent.errorCount > 0) {
+    html += `<span class="badge st-bad">err:${agent.errorCount}</span>`
+  }
+  if (agent.subagentCount && agent.subagentCount > 0) {
+    html += `<span class="badge st-ok">sub:${agent.subagentCount}</span>`
+  }
+  return html
 }
 
 /** One tail row: `seq type task? agent? — payload-brief`. */
@@ -61,6 +173,9 @@ export function statusPage(): string {
   .work { color:#facc15; }
   .review { color:#60a5fa; }
   .bad { color:#f87171; }
+  .badge { font-size:11px; color:#6b7280; border:1px solid #333; border-radius:3px; padding:1px 5px; margin-left:6px; }
+  .badge.st-ok { color:#4ade80; border-color:#2c4537; }
+  .badge.st-bad { color:#f87171; border-color:#4a2f2f; }
   .conn { font-weight:bold; }
   .conn.live { color:#4ade80; }
   .conn.reconnecting { color:#facc15; }
@@ -114,6 +229,43 @@ function age(heartbeatAt) {
   var seconds = Math.max(0, Math.floor((Date.now() - at) / 1000))
   if (seconds < 60) return seconds + 's ago'
   return Math.floor(seconds / 60) + 'm ago'
+}
+
+// Client mirrors of the server helpers above — deliberate duplication,
+// string concatenation only (no nested template literals in the page).
+
+function doingText(a) {
+  if (a.lastPhase && a.lastMessage) {
+    var msg = String(a.lastMessage)
+    if (msg.length > 60) msg = msg.slice(0, 60) + '…'
+    return String(a.status || 'working') + ' · ' + a.lastPhase + ' — ' + msg
+  }
+  if (a.lastPhase) return a.lastPhase
+  return '—'
+}
+
+function activityAge(a) {
+  var best = ''
+  var keys = ['lastActivityAt', 'heartbeatAt', 'lastReportAt']
+  for (var i = 0; i < keys.length; i++) {
+    var t = a[keys[i]]
+    if (!t) continue
+    var at = Date.parse(t)
+    if (isNaN(at)) continue
+    if (!best || at > Date.parse(best)) best = t
+  }
+  return age(best)
+}
+
+function doingCell(a) {
+  var html = esc(doingText(a))
+  var steps = [['claim', !!a.claimedAt], ['start', !!a.startedAt], ['ready', !!a.lastReadyAt]]
+  for (var i = 0; i < steps.length; i++) {
+    html += '<span class="badge ' + (steps[i][1] ? 'st-ok' : 'st-bad') + '">' + steps[i][0] + '</span>'
+  }
+  if (a.errorCount > 0) html += '<span class="badge st-bad">err:' + a.errorCount + '</span>'
+  if (a.subagentCount > 0) html += '<span class="badge st-ok">sub:' + a.subagentCount + '</span>'
+  return html
 }
 
 function timeShort(iso) {
@@ -185,14 +337,15 @@ function renderAgents() {
     el.innerHTML = '<span class="dim">no agents</span>'
     return
   }
-  var html = '<table><thead><tr><th>agentId</th><th>task</th><th>state</th><th>heartbeat</th><th>busy</th><th>stalled</th><th>died</th></tr></thead><tbody>'
+  var html = '<table><thead><tr><th>agentId</th><th>task</th><th>state</th><th>doing</th><th>activity</th><th>busy</th><th>stalled</th><th>died</th></tr></thead><tbody>'
   for (var i = 0; i < agents.length; i++) {
     var a = agents[i]
     html += '<tr class="' + agentClass(a) + '">'
     html += '<td>' + esc(a.agentId) + '</td>'
     html += '<td>' + esc(a.taskId || '—') + '</td>'
     html += '<td>' + esc(a.state || '—') + '</td>'
-    html += '<td>' + esc(age(a.heartbeatAt)) + '</td>'
+    html += '<td>' + doingCell(a) + '</td>'
+    html += '<td>' + esc(activityAge(a)) + '</td>'
     html += '<td>' + (a.busy ? 'yes' : 'no') + '</td>'
     html += '<td>' + (a.stalledAt ? 'yes' : 'no') + '</td>'
     html += '<td>' + (a.diedAt ? 'yes' : 'no') + '</td>'
