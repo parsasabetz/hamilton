@@ -233,11 +233,18 @@ claimed ──► started ──► working ──► idle ──► finished
 
 ## 6. Storage: three memory layers
 
-| Layer                          | Content                                                                                                | Where                                                              |
-| ------------------------------ | ------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------ |
-| **1. Constants (immutable)**   | `AGENTS.md`, execution plans, coding standards, the **check process**, runtime config, Hamilton config | Files on disk (agents read them directly) + KV mirror for the Core |
-| **2. Runtime state (mutable)** | task graph, agent registry, session registry, review status, budgets, heartbeats, run status           | DO storage + KV registries                                         |
-| **3. Artifacts (append-only)** | logs, progress reports, review reports, terminal output, metrics                                       | R2, keyed `runId/taskId/<seq>-<type>.json`                         |
+| Layer                        | Content                                                                                                                                                                                                 | Where                                                              |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| **1. Constants (immutable)** | `.hamilton/CONDUCTOR.md` + `.hamilton/AGENTS.md` (critical instructions), `AGENTS.md`, execution plans, coding standards, the **check process**, runtime config, Hamilton config (`hamilton.config.ts`) | Files on disk (agents read them directly) + KV mirror for the Core |
+
+**Project bootstrap:** `hamilton init` creates the constants layer in any project —
+`.hamilton/CONDUCTOR.md` and `.hamilton/AGENTS.md` (critical instructions for the
+conductor and its agents) plus `hamilton.config.ts` (default runtime config; all
+fields optional). Never overwrites existing files. The Core resolves config as
+defaults < `hamilton.config.ts` < explicit overrides, and fails loudly on a
+malformed file — the constants layer is trusted input.
+| **2. Runtime state (mutable)** | task graph, agent registry, session registry, review status, budgets, heartbeats, run status | DO storage + KV registries |
+| **3. Artifacts (append-only)** | logs, progress reports, review reports, terminal output, metrics | R2, keyed `runId/taskId/<seq>-<type>.json` |
 
 **The check process (constant):** the flow run at the very end of an agent finishing — `typecheck → format:check → tests → pre-commit hooks` (adapted from the pre-commit bar in `briefs/S2-motion-schema.md` §27). Executed by reviewers via restricted bash; results attached to the review document.
 
