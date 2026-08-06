@@ -16,18 +16,26 @@ import { createShim, isEventType, type ShimHandle } from "./client.ts"
 
 const VERSION = "0.0.0"
 
-configureSync({
-  sinks: { console: getConsoleSink() },
-  filters: { "*": "info" },
-  loggers: [
-    { category: ["hamilton"], lowestLevel: "info", sinks: ["console"] },
-    {
-      category: ["logtape", "meta"],
-      lowestLevel: "warning",
-      sinks: ["console"],
-    },
-  ],
-})
+// LogTape is global per process; the Core and the MCP server configure the
+// same ["hamilton", ...] loggers, and tests load both in one process. The
+// guard shares the flag via a global Symbol (same mechanism as the Core).
+const LOGGING_KEY = Symbol.for("hamilton.logging.configured")
+const globalForLogging = globalThis as Record<PropertyKey, unknown>
+if (globalForLogging[LOGGING_KEY] !== true) {
+  globalForLogging[LOGGING_KEY] = true
+  configureSync({
+    sinks: { console: getConsoleSink() },
+    filters: { "*": "info" },
+    loggers: [
+      { category: ["hamilton"], lowestLevel: "info", sinks: ["console"] },
+      {
+        category: ["logtape", "meta"],
+        lowestLevel: "warning",
+        sinks: ["console"],
+      },
+    ],
+  })
+}
 
 const logger = getLogger(["hamilton", "mcp"])
 

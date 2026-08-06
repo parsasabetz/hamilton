@@ -2,7 +2,7 @@
 // M2: the autonomous-execution loop — dispatcher (worktrees/sessions/merges),
 // worktree watcher (event-based git status), permission responder, live graph.
 
-import { configureSync, getConsoleSink, getLogger } from "@logtape/logtape"
+import { getLogger } from "@logtape/logtape"
 import { hamiltonEventTypes } from "@hamilton/shared"
 import type { HamiltonEvent } from "@hamilton/shared"
 
@@ -12,6 +12,7 @@ import { createDispatcher, createPermissionResponder } from "./dispatch.ts"
 import type { TaskSessionSpec } from "./dispatch.ts"
 import { createBus } from "./eventbus.ts"
 import type { EmitInput } from "./eventbus.ts"
+import { configureHamiltonLogging } from "./logging.ts"
 import { createControlPlane } from "./opencode.ts"
 import { createBrain } from "./runtime.ts"
 import { statusPage } from "./status-page.ts"
@@ -26,6 +27,7 @@ export * from "./constants.ts"
 export * from "./dispatch.ts"
 export * from "./eventbus.ts"
 export * from "./git.ts"
+export * from "./logging.ts"
 export * from "./opencode.ts"
 export * from "./planner.ts"
 export * from "./runtime.ts"
@@ -68,18 +70,7 @@ export interface CoreHandle {
   brain: Awaited<ReturnType<typeof createBrain>>
 }
 
-configureSync({
-  sinks: { console: getConsoleSink() },
-  filters: { "*": "info" },
-  loggers: [
-    { category: ["hamilton"], lowestLevel: "info", sinks: ["console"] },
-    {
-      category: ["logtape", "meta"],
-      lowestLevel: "warning",
-      sinks: ["console"],
-    },
-  ],
-})
+configureHamiltonLogging()
 
 const logger = getLogger(["hamilton", "core"])
 
