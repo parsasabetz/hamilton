@@ -393,6 +393,36 @@ export function createDispatcher(ctx: DispatchContext): DispatcherHandle {
     }
   }
 
+  async function verifyPr(
+    action: Extract<CoreAction, { action: "pr.verify" }>,
+  ): Promise<CoreActionResult> {
+    try {
+      const res = Bun.spawnSync(
+        ["gh", "pr", "view", action.branch, "--json", "url,baseRefName,state"],
+        { stdout: "pipe", stderr: "pipe" },
+      )
+      return {
+        ok: true,
+        prVerification: prVerificationFrom(
+          res.exitCode,
+          res.stdout.toString(),
+          res.stderr.toString(),
+          action.parent,
+          action.branch,
+        ),
+      }
+    } catch (err) {
+      logger.warn("pr.verify failed for {taskId}: {error}", {
+        taskId: action.taskId,
+        error: errorMessage(err),
+      })
+      return {
+        ok: true,
+        prVerification: { verified: false, reason: errorMessage(err) },
+      }
+    }
+  }
+
   return {
     async handleAction(action) {
       switch (action.action) {
@@ -410,6 +440,8 @@ export function createDispatcher(ctx: DispatchContext): DispatcherHandle {
           return cleanupReview(action)
         case "merge.execute":
           return executeMerge(action)
+        case "pr.verify":
+          return verifyPr(action)
         default:
           return { ok: false, error: "unknown action" }
       }
@@ -739,27 +771,88 @@ const IMPLEMENTER_TOOLS = new Set([
   "write",
   "apply_patch",
   "todowrite",
+  "run_status",
 ])
 const REVIEWER_TOOLS = new Set(["read", "glob", "grep", "list", "bash"])
 const PLANNER_TOOLS = new Set(["read", "glob", "grep", "list"])
+const CONDUCTOR_TOOLS = new Set([
+  "read",
+  "glob",
+  "grep",
+  "list",
+  "webfetch",
+  "start_run",
+  "run_status",
+  "checkpoint",
+  "emit_event",
+  "ask_question",
+  "bash",
+])
+const ASSISTANT_TOOLS = new Set(["read", "glob", "grep", "list", "webfetch"])
 
 const DANGEROUS_GIT =
   /git (push|rebase|reset|checkout|switch|merge|clean|fetch)/
 const REVIEWER_BASH =
   /^(git (diff|log|show|status)|(pnpm|npm|bun) (test|typecheck|format:check|lint)|grep|rg)/
+const CONDUCTOR_BASH = /^git (status|log|diff)/
+const NETWORK_CMDS = /(curl|wget)\b/
+const HAMILTON_CLI = /\bhamilton\b/
+const WORKTREE_OR_BRANCH = /(git (worktree|branch))\b/
+
+/**
+ * The ref an implementer's `git push origin <ref>` targets, or null when
+ * the command is not such a push (including a ref-less `git push`, which
+ * defaults to the current branch).
+ */
+export function extractPushedRef(command: string): string | null {
+  const match = command.trim().match(/^git push origin\s+(\S+)/)
+  return match === null ? null : (match[1] ?? null)
+}
+
+/** A ref-less push (`git push` / `git push origin`) targets the current branch. */
+function isReflessPush(command: string): boolean {
+  return /^git push( origin)?\s*$/.test(command.trim())
+}
 
 export function decidePermission(
   role: string,
   tool: string,
   input: Record<string, unknown>,
+  ctx?: { branch?: string },
 ): { allow: boolean; reason: string } {
   const command = typeof input["command"] === "string" ? input["command"] : ""
+  if (tool === "start_run" && role !== "conductor") {
+    return { allow: false, reason: "only the conductor starts runs" }
+  }
   if (role === "implementer") {
     if (!IMPLEMENTER_TOOLS.has(tool)) {
       return { allow: false, reason: `implementer may not use ${tool}` }
     }
-    if (tool === "bash" && DANGEROUS_GIT.test(command)) {
-      return { allow: false, reason: "dangerous git" }
+    if (tool === "bash") {
+      if (NETWORK_CMDS.test(command)) {
+        return { allow: false, reason: "network via curl/wget denied" }
+      }
+      if (HAMILTON_CLI.test(command)) {
+        return { allow: false, reason: "hamilton CLI not permitted" }
+      }
+      if (WORKTREE_OR_BRANCH.test(command)) {
+        return { allow: false, reason: "worktree/branch manipulation denied" }
+      }
+      const pushedRef = extractPushedRef(command)
+      if (pushedRef !== null || isReflessPush(command)) {
+        const own =
+          ctx?.branch !== undefined &&
+          (pushedRef === null ||
+            pushedRef === ctx.branch ||
+            pushedRef === "HEAD")
+        if (own) {
+          return { allow: true, reason: "own branch push" }
+        }
+        return { allow: false, reason: "push only your own task branch" }
+      }
+      if (DANGEROUS_GIT.test(command)) {
+        return { allow: false, reason: "dangerous git" }
+      }
     }
     return { allow: true, reason: "implementer permission" }
   }
@@ -783,6 +876,24 @@ export function decidePermission(
       return { allow: false, reason: `planner may not use ${tool}` }
     }
     return { allow: true, reason: "planner permission" }
+  }
+  if (role === "conductor") {
+    if (tool === "bash") {
+      if (!CONDUCTOR_BASH.test(command)) {
+        return { allow: false, reason: "conductor requires read-only git" }
+      }
+      return { allow: true, reason: "conductor permission" }
+    }
+    if (!CONDUCTOR_TOOLS.has(tool)) {
+      return { allow: false, reason: `conductor may not use ${tool}` }
+    }
+    return { allow: true, reason: "conductor permission" }
+  }
+  if (role === "assistant") {
+    if (!ASSISTANT_TOOLS.has(tool)) {
+      return { allow: false, reason: `assistant may not use ${tool}` }
+    }
+    return { allow: true, reason: "assistant permission" }
   }
   return { allow: false, reason: `unknown role: ${role}` }
 }
@@ -831,12 +942,17 @@ export function extractPermissionRequest(
   return { sessionID, requestID, tool, input }
 }
 
-export interface PermissionResponderContext {
+export interface PermissionResponderCtx {
   controlPlane: ControlPlane | undefined
   roleForSession?: (sessionId: string) => string | undefined
+  /** Resolves the session's task branch, so implementers may only push it. */
+  branchForSession?: (sessionId: string) => string | undefined
 }
 
-export function createPermissionResponder(ctx: PermissionResponderContext): {
+/** @deprecated use {@link PermissionResponderCtx} */
+export type PermissionResponderContext = PermissionResponderCtx
+
+export function createPermissionResponder(ctx: PermissionResponderCtx): {
   handleTelemetry(event: HamiltonEvent): Promise<void>
 } {
   return {
@@ -845,7 +961,13 @@ export function createPermissionResponder(ctx: PermissionResponderContext): {
       const request = extractPermissionRequest(event.payload)
       if (request === null) return
       const role = ctx.roleForSession?.(request.sessionID) ?? "implementer"
-      const decision = decidePermission(role, request.tool, request.input)
+      const branch = ctx.branchForSession?.(request.sessionID)
+      const decision = decidePermission(
+        role,
+        request.tool,
+        request.input,
+        branch === undefined ? undefined : { branch },
+      )
       const plane = ctx.controlPlane
       if (plane === undefined) {
         logger.info(
@@ -883,6 +1005,76 @@ export function createPermissionResponder(ctx: PermissionResponderContext): {
       }
     },
   }
+}
+
+/** Informational PR verification: never gates the run, so no ok:false. */
+export interface PrVerification {
+  verified: boolean
+  prUrl?: string
+  base?: string
+  reason?: string
+}
+
+/** Parse `gh pr view --json url,baseRefName,state` stdout; null on garbage. */
+export function parseGhPrView(
+  stdout: string,
+): { url?: string; base?: string; state?: string } | null {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(stdout)
+  } catch {
+    return null
+  }
+  if (!isRecord(parsed) || Array.isArray(parsed)) return null
+  const result: { url?: string; base?: string; state?: string } = {}
+  const url = parsed["url"]
+  const base = parsed["baseRefName"]
+  const state = parsed["state"]
+  if (typeof url === "string") result["url"] = url
+  if (typeof base === "string") result["base"] = base
+  if (typeof state === "string") result["state"] = state
+  return result
+}
+
+/**
+ * Map a `gh pr view` invocation onto an informational verification.
+ * Missing gh / no PR / wrong base all yield verified:false with a reason.
+ */
+export function prVerificationFrom(
+  exitCode: number,
+  stdout: string,
+  stderr: string,
+  parent: string,
+  branch?: string,
+): PrVerification {
+  if (exitCode !== 0) {
+    if (stderr.toLowerCase().includes("no pull requests found")) {
+      return {
+        verified: false,
+        reason:
+          branch === undefined || branch === ""
+            ? "no PR found"
+            : `no PR found for ${branch}`,
+      }
+    }
+    const detail = stderr.trim()
+    return { verified: false, reason: detail === "" ? "gh failed" : detail }
+  }
+  const parsed = parseGhPrView(stdout)
+  if (parsed === null) {
+    return { verified: false, reason: "gh output is not valid JSON" }
+  }
+  const base = parsed["base"]
+  if (base === undefined) {
+    return { verified: false, reason: "gh output missing baseRefName" }
+  }
+  const result: PrVerification = { verified: base === parent }
+  if (parsed["url"] !== undefined) result["prUrl"] = parsed["url"]
+  result["base"] = base
+  if (base !== parent) {
+    result["reason"] = `PR base ${base} != parent ${parent}`
+  }
+  return result
 }
 
 function errorMessage(err: unknown): string {

@@ -15,6 +15,9 @@ import {
   createPermissionResponder,
   decidePermission,
   extractPermissionRequest,
+  extractPushedRef,
+  parseGhPrView,
+  prVerificationFrom,
   renderReadSummary,
   reviewWorktreePathFor,
 } from "./dispatch.ts"
@@ -172,6 +175,150 @@ describe("decidePermission", () => {
     expect(
       decidePermission("admin", "bash", { command: "git diff" }).allow,
     ).toBe(false)
+  })
+
+  test("implementer is denied curl, wget, hamilton, and worktree/branch", () => {
+    expect(
+      decidePermission("implementer", "bash", {
+        command: "curl -s http://localhost:4567/api/run",
+      }),
+    ).toEqual({ allow: false, reason: "network via curl/wget denied" })
+    expect(
+      decidePermission("implementer", "bash", { command: "wget -O - http://x" })
+        .allow,
+    ).toBe(false)
+    expect(
+      decidePermission("implementer", "bash", { command: "hamilton dev" })
+        .allow,
+    ).toBe(false)
+    expect(
+      decidePermission("implementer", "bash", { command: "git worktree add x" })
+        .allow,
+    ).toBe(false)
+    expect(
+      decidePermission("implementer", "bash", { command: "git branch -d old" })
+        .allow,
+    ).toBe(false)
+  })
+
+  test("implementer may only push the session's own branch", () => {
+    expect(
+      decidePermission("implementer", "bash", {
+        command: "git push origin feat/t1",
+      }),
+    ).toEqual({ allow: false, reason: "push only your own task branch" })
+    expect(
+      decidePermission(
+        "implementer",
+        "bash",
+        { command: "git push origin feat/t1" },
+        { branch: "feat/t1" },
+      ),
+    ).toEqual({ allow: true, reason: "own branch push" })
+    expect(
+      decidePermission(
+        "implementer",
+        "bash",
+        { command: "git push origin feat/t2" },
+        { branch: "feat/t1" },
+      ),
+    ).toEqual({ allow: false, reason: "push only your own task branch" })
+  })
+
+  test("implementer may push HEAD or a ref-less push on its own branch", () => {
+    expect(
+      decidePermission(
+        "implementer",
+        "bash",
+        { command: "git push origin HEAD" },
+        { branch: "feat/t1" },
+      ).allow,
+    ).toBe(true)
+    expect(
+      decidePermission(
+        "implementer",
+        "bash",
+        { command: "git push" },
+        { branch: "feat/t1" },
+      ).allow,
+    ).toBe(true)
+    expect(
+      decidePermission(
+        "implementer",
+        "bash",
+        { command: "git push origin" },
+        { branch: "feat/t1" },
+      ).allow,
+    ).toBe(true)
+    expect(
+      decidePermission(
+        "implementer",
+        "bash",
+        { command: "git push" },
+        undefined,
+      ),
+    ).toEqual({ allow: false, reason: "push only your own task branch" })
+  })
+
+  test("implementer may run run_status but never start_run", () => {
+    expect(decidePermission("implementer", "run_status", {}).allow).toBe(true)
+    expect(decidePermission("implementer", "start_run", {})).toEqual({
+      allow: false,
+      reason: "only the conductor starts runs",
+    })
+  })
+
+  test("conductor may start runs and read, but not edit or push", () => {
+    expect(decidePermission("conductor", "start_run", {}).allow).toBe(true)
+    expect(decidePermission("conductor", "read", {}).allow).toBe(true)
+    expect(decidePermission("conductor", "webfetch", {}).allow).toBe(true)
+    expect(decidePermission("conductor", "edit", {}).allow).toBe(false)
+    expect(
+      decidePermission("conductor", "bash", { command: "git push origin x" })
+        .allow,
+    ).toBe(false)
+    expect(
+      decidePermission("conductor", "bash", { command: "git status" }).allow,
+    ).toBe(true)
+  })
+
+  test("assistant is read-only and never starts runs", () => {
+    expect(decidePermission("assistant", "read", {}).allow).toBe(true)
+    expect(decidePermission("assistant", "grep", {}).allow).toBe(true)
+    expect(decidePermission("assistant", "edit", {}).allow).toBe(false)
+    expect(
+      decidePermission("assistant", "bash", { command: "git status" }).allow,
+    ).toBe(false)
+    expect(decidePermission("assistant", "start_run", {})).toEqual({
+      allow: false,
+      reason: "only the conductor starts runs",
+    })
+  })
+
+  test("reviewer and planner never start runs", () => {
+    expect(decidePermission("reviewer", "start_run", {})).toEqual({
+      allow: false,
+      reason: "only the conductor starts runs",
+    })
+    expect(decidePermission("planner", "start_run", {})).toEqual({
+      allow: false,
+      reason: "only the conductor starts runs",
+    })
+  })
+})
+
+describe("extractPushedRef", () => {
+  test("parses the ref of a git push origin command", () => {
+    expect(extractPushedRef("git push origin feat/t1")).toBe("feat/t1")
+    expect(extractPushedRef("git push origin HEAD")).toBe("HEAD")
+    expect(extractPushedRef("git push origin feat/t1 --force")).toBe("feat/t1")
+  })
+
+  test("returns null when the command is not a git push", () => {
+    expect(extractPushedRef("git push")).toBeNull()
+    expect(extractPushedRef("git push origin")).toBeNull()
+    expect(extractPushedRef("git status")).toBeNull()
+    expect(extractPushedRef("")).toBeNull()
   })
 })
 
@@ -761,5 +908,108 @@ describe("createPermissionResponder", () => {
       seq: 2,
       payload: {},
     })
+  })
+})
+
+describe("parseGhPrView", () => {
+  test("parses a valid gh pr view JSON payload", () => {
+    expect(
+      parseGhPrView(
+        '{"url":"https://github.com/acme/ham/pull/9","baseRefName":"main","state":"OPEN"}',
+      ),
+    ).toEqual({
+      url: "https://github.com/acme/ham/pull/9",
+      base: "main",
+      state: "OPEN",
+    })
+  })
+
+  test("returns null for invalid JSON or non-objects", () => {
+    expect(parseGhPrView("garbage")).toBeNull()
+    expect(parseGhPrView("[1,2,3]")).toBeNull()
+    expect(parseGhPrView("")).toBeNull()
+  })
+})
+
+describe("prVerificationFrom", () => {
+  test("verifies a PR whose base matches the parent", () => {
+    const stdout = JSON.stringify({
+      url: "https://github.com/acme/ham/pull/1",
+      baseRefName: "main",
+      state: "OPEN",
+    })
+    expect(prVerificationFrom(0, stdout, "", "main", "feat/t1")).toEqual({
+      verified: true,
+      prUrl: "https://github.com/acme/ham/pull/1",
+      base: "main",
+    })
+  })
+
+  test("flags a PR whose base does not match the parent", () => {
+    const stdout = JSON.stringify({
+      url: "https://github.com/acme/ham/pull/2",
+      baseRefName: "dev",
+      state: "DRAFT",
+    })
+    expect(prVerificationFrom(0, stdout, "", "main", "feat/t1")).toEqual({
+      verified: false,
+      prUrl: "https://github.com/acme/ham/pull/2",
+      base: "dev",
+      reason: "PR base dev != parent main",
+    })
+  })
+
+  test("reports a missing PR", () => {
+    expect(
+      prVerificationFrom(
+        1,
+        "",
+        'no pull requests found for branch "feat/t1"\n',
+        "main",
+        "feat/t1",
+      ),
+    ).toEqual({ verified: false, reason: "no PR found for feat/t1" })
+  })
+
+  test("reports gh errors without a branch in the reason", () => {
+    expect(prVerificationFrom(1, "", "gh: not logged in\n", "main")).toEqual({
+      verified: false,
+      reason: "gh: not logged in",
+    })
+  })
+
+  test("handles invalid JSON on exit 0", () => {
+    expect(prVerificationFrom(0, "not json", "", "main", "feat/t1")).toEqual({
+      verified: false,
+      reason: "gh output is not valid JSON",
+    })
+  })
+})
+
+describe("createDispatcher — pr.verify (best-effort gh)", () => {
+  test("never returns ok:false, regardless of gh availability", async () => {
+    const { bus } = stubBus()
+    const { brain } = stubBrain()
+    const dispatcher = createDispatcher({
+      runId: "run-1",
+      repoRoot: "/tmp/unused",
+      worktreesDir: ".worktrees",
+      parent: "main",
+      config: hamiltonConfigSchema.parse({}),
+      bus,
+      brain,
+      controlPlane: undefined,
+    })
+    const result = await dispatcher.handleAction({
+      action: "pr.verify",
+      runId: "run-1",
+      taskId: "t1",
+      branch: `feat/pr-verify-${crypto.randomUUID().slice(0, 8)}`,
+      parent: "main",
+    })
+    expect(result.ok).toBe(true)
+    if (result.ok) {
+      expect(result.prVerification?.verified).toBe(false)
+    }
   })
 })
