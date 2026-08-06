@@ -174,6 +174,13 @@ export type CoreAction =
       branch: string
       parent: string
     }
+  | {
+      action: "pr.verify"
+      runId: string
+      taskId: string
+      branch: string
+      parent: string
+    }
 
 export type CoreActionResult =
   | {
@@ -183,6 +190,12 @@ export type CoreActionResult =
       mergeCommit?: string
       reviewerSessionIds?: string[]
       reviewWorktreePath?: string
+      prVerification?: {
+        verified: boolean
+        prUrl?: string
+        base?: string
+        reason?: string
+      }
     }
   | { ok: false; error: string }
 
@@ -253,6 +266,17 @@ export const hamiltonConfigSchema = z.object({
       vetoRoles: ["*"],
       maxRetries: 2,
     }),
+  /** Parent branch the conductor assigns to all task branches (rule: agents
+   *  may only target it). Precedence: run.planned payload > HAMILTON_PARENT_BRANCH
+   *  env > this config > "main". */
+  parentBranch: z.string().default("main"),
+  /** Protocol enforcement: when true, ready-for-review tasks with hard
+   *  protocol violations (no claim, no start) fail the gate deterministically. */
+  protocol: z
+    .object({
+      blockOnViolation: z.boolean(),
+    })
+    .default({ blockOnViolation: false }),
 })
 
 export type HamiltonConfig = z.infer<typeof hamiltonConfigSchema>
@@ -262,18 +286,72 @@ export const defaultHamiltonConfig: HamiltonConfig = hamiltonConfigSchema.parse(
 )
 
 // HAMILTON.md §7 — the agent-facing MCP tool surface.
+// One responsibility per tool; validation errors are actionable.
 
 export const hamiltonToolNames = [
-  "heartbeat",
   "checkpoint",
   "emit_event",
   "ask_question",
   "report_subagent",
   "ready_for_review",
   "submit_review",
+  "start_run",
+  "run_status",
 ] as const
 
 export type HamiltonToolName = (typeof hamiltonToolNames)[number]
+
+// Checkpoint phases — the official reporting vocabulary. Each phase maps to a
+// deterministic event; `status` is the agent's self-assessment, constrained by
+// the phase compatibility matrix below.
+
+export const checkpointPhases = [
+  "claimed",
+  "started",
+  "working",
+  "milestone",
+  "error",
+  "blocked",
+  "ready-for-review",
+] as const
+
+export type CheckpointPhase = (typeof checkpointPhases)[number]
+
+export const checkpointStatuses = ["working", "blocked", "complete"] as const
+
+export type CheckpointStatus = (typeof checkpointStatuses)[number]
+
+/** phase → allowed statuses (the compatibility matrix). */
+export const checkpointPhaseStatus: Record<
+  CheckpointPhase,
+  readonly CheckpointStatus[]
+> = {
+  claimed: ["working"],
+  started: ["working"],
+  working: ["working"],
+  milestone: ["working"],
+  error: ["blocked"],
+  blocked: ["blocked"],
+  "ready-for-review": ["complete"],
+}
+
+/** Actionable, generated-from-the-matrix error for a bad phase/status combo. */
+export function checkpointMatrixError(phase: string, status: string): string {
+  const required = checkpointPhaseStatus[phase as CheckpointPhase]
+  const allowed = Object.entries(checkpointPhaseStatus)
+    .map(
+      ([allowedPhase, statuses]) => `${allowedPhase} → ${statuses.join(", ")}`,
+    )
+    .join("\n")
+  return [
+    "Invalid checkpoint combination:",
+    `phase="${phase}" requires status="${required?.[0] ?? "?"}"`,
+    `received status="${status}"`,
+    "",
+    "Allowed:",
+    allowed,
+  ].join("\n")
+}
 
 export interface HamiltonToolSpec {
   name: HamiltonToolName
@@ -283,24 +361,25 @@ export interface HamiltonToolSpec {
 
 export const hamiltonToolSpecs: HamiltonToolSpec[] = [
   {
-    name: "heartbeat",
-    description:
-      "Report liveness to the orchestrator; resets the heartbeat-expiry alarm.",
-    inputSchema: z.object({
-      note: z.string().optional(),
-    }),
-  },
-  {
     name: "checkpoint",
     description:
-      "Emit an agent.milestone event and append a progress artifact.",
-    inputSchema: z.object({
-      phase: z
-        .string()
-        .describe("e.g. claimed | started | milestone | ready-for-review"),
-      message: z.string(),
-      files: z.array(z.string()).optional(),
-    }),
+      "Report what you are doing. phase selects the event (claimed/started/error/blocked/ready-for-review map to their events; working/milestone record progress); status is your self-assessment and must match the phase (see the compatibility matrix in your guidelines). Invalid combinations error with the allowed matrix.",
+    inputSchema: z
+      .object({
+        phase: z.enum(checkpointPhases),
+        status: z.enum(checkpointStatuses),
+        message: z.string().min(1).describe("What you are doing right now"),
+        files: z.array(z.string()).optional(),
+      })
+      .superRefine((value, ctx) => {
+        const allowed = checkpointPhaseStatus[value.phase]
+        if (allowed !== undefined && !allowed.includes(value.status)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: checkpointMatrixError(value.phase, value.status),
+          })
+        }
+      }),
   },
   {
     name: "emit_event",
@@ -322,7 +401,8 @@ export const hamiltonToolSpecs: HamiltonToolSpec[] = [
   },
   {
     name: "report_subagent",
-    description: "Report a spawned subagent: role, objective, and result.",
+    description:
+      "Report a spawned subagent: role, objective, and result. Emits both the spawn and the result deterministically.",
     inputSchema: z.object({
       role: z.string(),
       objective: z.string(),
@@ -342,7 +422,7 @@ export const hamiltonToolSpecs: HamiltonToolSpec[] = [
   {
     name: "submit_review",
     description:
-      "File a structured review: role, verdict, and findings (id, location, issue, suggested fix).",
+      "File a structured review: role, verdict, and findings (id, location, issue, suggested fix). Reviewer outputs are immutable — a changed mind files Review #2.",
     inputSchema: z.object({
       reviewer: z
         .string()
@@ -363,6 +443,45 @@ export const hamiltonToolSpecs: HamiltonToolSpec[] = [
         .optional(),
       testsWritten: z.array(z.string()).optional(),
       summary: z.string().optional(),
+    }),
+  },
+  {
+    name: "start_run",
+    description:
+      "Start an autonomous run (conductor-only — assistants must never call this). Accepts a minimal plan: the planner validates it and expands defaults (branch, status, model, pr_title). Exactly one of planJson (a task-graph JSON) or prompt (decomposed by the planner) is required.",
+    inputSchema: z
+      .object({
+        planJson: z
+          .string()
+          .optional()
+          .describe("Task-graph JSON (zod-validated; defaults expanded)"),
+        prompt: z
+          .string()
+          .optional()
+          .describe("Request the planner decomposes"),
+        mergeAuthority: z.enum(["autonomous", "owner-gated"]).optional(),
+      })
+      .superRefine((value, ctx) => {
+        if (value.planJson === undefined && value.prompt === undefined) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: 'start_run requires exactly one of "planJson" or "prompt"',
+          })
+        }
+        if (value.planJson !== undefined && value.prompt !== undefined) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: 'start_run accepts "planJson" OR "prompt", not both',
+          })
+        }
+      }),
+  },
+  {
+    name: "run_status",
+    description:
+      "Summarize a run's state. Read-only: MUST NOT compute, mutate, trigger, or repair — ONLY summarize. Returns the RunStatusSummary DTO (phase, progress, agents with doing/activity, tasks, violations).",
+    inputSchema: z.object({
+      runId: z.string(),
     }),
   },
 ]
@@ -386,4 +505,59 @@ export interface ReviewSubmission {
   checksRun?: Array<{ name: string; ok: boolean }>
   testsWritten?: string[]
   summary?: string
+}
+
+// run_status DTO — a dedicated summary contract so the tool never depends on
+// raw run-state internals (they can evolve freely).
+
+export interface RunStatusAgent {
+  agentId: string
+  taskId?: string
+  state: string
+  doing?: {
+    phase?: string
+    status?: string
+    message?: string
+  }
+  activityAgeMs?: number
+  protocol?: {
+    claimed: boolean
+    started: boolean
+    errors: number
+    subagents: number
+    ready: boolean
+  }
+}
+
+export interface RunStatusTask {
+  id: string
+  status: string
+  role: string
+  branch?: string
+  reviewRetries?: number
+}
+
+export interface RunStatusViolation {
+  taskId?: string
+  agentId?: string
+  kind: string
+  detail: string
+}
+
+export interface RunStatusSummary {
+  runId: string
+  phase: string
+  seq: number
+  updatedAt?: string
+  progress: {
+    planned: number
+    inProgress: number
+    reviewing: number
+    approved: number
+    merged: number
+    blocked: number
+  }
+  agents: RunStatusAgent[]
+  tasks: RunStatusTask[]
+  violations: RunStatusViolation[]
 }

@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test"
 import {
+  checkpointPhases,
+  checkpointPhaseStatus,
+  checkpointMatrixError,
   hamiltonConfigSchema,
+  hamiltonToolNames,
   hamiltonToolSpecs,
   taskGraphSchema,
   taskSchema,
@@ -205,5 +209,105 @@ describe("submit_review tool spec", () => {
     expect(
       spec.inputSchema.safeParse({ reviewer: "x", verdict: "maybe" }).success,
     ).toBe(false)
+  })
+})
+
+describe("checkpoint compatibility matrix", () => {
+  test("every phase lists at least one allowed status", () => {
+    for (const phase of checkpointPhases) {
+      expect(checkpointPhaseStatus[phase].length).toBeGreaterThan(0)
+    }
+  })
+
+  test("actionable error names the requirement, the received value, and the full matrix", () => {
+    const error = checkpointMatrixError("blocked", "working")
+    expect(error).toBe(
+      [
+        "Invalid checkpoint combination:",
+        'phase="blocked" requires status="blocked"',
+        'received status="working"',
+        "",
+        "Allowed:",
+        "claimed → working",
+        "started → working",
+        "working → working",
+        "milestone → working",
+        "error → blocked",
+        "blocked → blocked",
+        "ready-for-review → complete",
+      ].join("\n"),
+    )
+  })
+
+  test("checkpoint spec accepts valid combos and rejects invalid ones", () => {
+    const spec = hamiltonToolSpecs.find((s) => s.name === "checkpoint")!
+    expect(
+      spec.inputSchema.safeParse({
+        phase: "claimed",
+        status: "working",
+        message: "brief read",
+      }).success,
+    ).toBe(true)
+    expect(
+      spec.inputSchema.safeParse({
+        phase: "ready-for-review",
+        status: "complete",
+        message: "done",
+      }).success,
+    ).toBe(true)
+    const bad = spec.inputSchema.safeParse({
+      phase: "claimed",
+      status: "complete",
+      message: "oops",
+    })
+    expect(bad.success).toBe(false)
+    expect(String(bad.error?.issues[0]?.message)).toContain(
+      'phase="claimed" requires status="working"',
+    )
+    expect(String(bad.error?.issues[0]?.message)).toContain("Allowed:")
+  })
+
+  test("heartbeat is gone from the tool surface", () => {
+    expect((hamiltonToolNames as readonly string[]).includes("heartbeat")).toBe(
+      false,
+    )
+    expect(
+      hamiltonToolSpecs.some((s: { name: string }) => s.name === "heartbeat"),
+    ).toBe(false)
+  })
+
+  test("start_run requires exactly one of planJson or prompt", () => {
+    const spec = hamiltonToolSpecs.find((s) => s.name === "start_run")!
+    expect(spec.inputSchema.safeParse({ planJson: "{}" }).success).toBe(true)
+    expect(spec.inputSchema.safeParse({ prompt: "build an app" }).success).toBe(
+      true,
+    )
+    expect(spec.inputSchema.safeParse({}).success).toBe(false)
+    expect(
+      spec.inputSchema.safeParse({ planJson: "{}", prompt: "x" }).success,
+    ).toBe(false)
+  })
+
+  test("run_status carries the read-only contract in its description", () => {
+    const spec = hamiltonToolSpecs.find((s) => s.name === "run_status")!
+    expect(spec.description).toContain("MUST NOT")
+    expect(spec.description).toContain("ONLY summarize")
+  })
+})
+
+describe("hamiltonConfigSchema conductor additions", () => {
+  test("parentBranch and protocol defaults", () => {
+    const cfg = hamiltonConfigSchema.parse({})
+    expect(cfg.parentBranch).toBe("main")
+    expect(cfg.protocol).toEqual({ blockOnViolation: false })
+  })
+
+  test("accepts overrides", () => {
+    const cfg = hamiltonConfigSchema.parse({
+      parentBranch: "feat/webapp",
+      protocol: { blockOnViolation: true },
+    })
+    expect(cfg.parentBranch).toBe("feat/webapp")
+    expect(cfg.protocol.blockOnViolation).toBe(true)
   })
 })
