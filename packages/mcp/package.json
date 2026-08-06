@@ -1,0 +1,21 @@
+{
+  "name": "@hamilton/mcp",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "start": "bun src/index.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@hamilton/shared": "workspace:*",
+    "@logtape/logtape": "^2.3.0",
+    "@modelcontextprotocol/sdk": "^1.30.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14"
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "name": "@hamilton/cli",
+  "version": "0.0.0",
+  "private": true,
+  "bin": {
+    "hamilton": "./src/index.ts"
+  },
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "dev": "bun --watch src/index.ts dev",
+    "start": "bun src/index.ts dev",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@hamilton/core": "workspace:*",
+    "citty": "^0.2.2"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14"
+  }
+}
