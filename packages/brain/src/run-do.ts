@@ -1045,30 +1045,41 @@ export class RunDO extends DurableObject<Env> {
   // Deduped via REGISTRY `issued:` markers so redelivery never double-issues.
   private async maybeAct(snapshot: RunSnapshot, runId: string): Promise<void> {
     const actions = actionsFor(snapshot, this.config)
+    // Sequential by design: each action's issued-marker check/write must
+    // complete before the next (KV get→put ordering within the loop).
+    // oxlint-disable-next-line no-await-in-loop
     for (const action of actions) {
       const issuedKey = `issued:${runId}:${action.taskId}:${action.action}`
+      // oxlint-disable-next-line no-await-in-loop
       if ((await this.env.REGISTRY.get(issuedKey)) !== null) continue
+      // oxlint-disable-next-line no-await-in-loop
       await this.env.REGISTRY.put(issuedKey, "1", {
         expirationTtl: ISSUED_TTL_SECONDS,
       })
       try {
+        // oxlint-disable-next-line no-await-in-loop
         const response = await this.env.CORE.fetch("http://core/action", {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify(action),
         })
+        // oxlint-disable-next-line no-await-in-loop
         const result = (await response.json()) as CoreActionResult
         if (!result.ok) {
           // Retry on the next event: drop the issued marker so a later
           // maybeAct pass re-attempts the action (bounded by event cadence).
+          // oxlint-disable-next-line no-await-in-loop
           await this.env.REGISTRY.delete(issuedKey)
+          // oxlint-disable-next-line no-await-in-loop
           await this.env.REGISTRY.put(
             `failed:${runId}:${action.taskId}:${action.action}`,
             result.error,
           )
         }
       } catch (error) {
+        // oxlint-disable-next-line no-await-in-loop
         await this.env.REGISTRY.delete(issuedKey)
+        // oxlint-disable-next-line no-await-in-loop
         await this.env.REGISTRY.put(
           `failed:${runId}:${action.taskId}:${action.action}`,
           error instanceof Error ? error.message : String(error),

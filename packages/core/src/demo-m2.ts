@@ -74,6 +74,7 @@ async function fakeAgent(taskId: string, worktreePath: string): Promise<void> {
       { message: "implemented + committed", files: [`${taskId}.txt`] },
     ],
   ] as const) {
+    // oxlint-disable-next-line no-await-in-loop -- staged emissions, sequential by design
     await fetch(`http://localhost:${PORT}/api/events`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -85,6 +86,7 @@ async function fakeAgent(taskId: string, worktreePath: string): Promise<void> {
         payload,
       }),
     })
+    // oxlint-disable-next-line no-await-in-loop -- staged emissions, sequential by design
     await Bun.sleep(150)
   }
   await fetch(`http://localhost:${PORT}/api/events`, {
@@ -187,6 +189,7 @@ async function main(): Promise<void> {
 
   const driver = async (): Promise<void> => {
     while (true) {
+      // oxlint-disable-next-line no-await-in-loop -- deliberate poll loop
       const snapshot = await fetchSnapshot()
       const phase = snapshot.phase
       const tasks = snapshot.tasks ?? []
@@ -202,6 +205,7 @@ async function main(): Promise<void> {
             String(task["branch"] ?? `feat/${id}`),
           )
           if (row && typeof row["worktreePath"] === "string") {
+            // oxlint-disable-next-line no-await-in-loop -- sequential agent drive
             await fakeAgent(id, row["worktreePath"])
           } else {
             console.log(`  no worktree row yet for ${id}; retrying`)

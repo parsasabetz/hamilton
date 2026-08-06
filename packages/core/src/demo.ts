@@ -139,6 +139,7 @@ async function waitForTaskStatus(
 ): Promise<Record<string, unknown> | null> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
+    // oxlint-disable-next-line no-await-in-loop -- deliberate poll loop
     const snapshot = await fetchState()
     const tasks = snapshot?.["tasks"]
     if (Array.isArray(tasks)) {
