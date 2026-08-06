@@ -17,6 +17,8 @@ export interface BrainOptions {
   persistDir: string
   /** Resolved Hamilton config, passed to the worker as the CONFIG binding. */
   config: HamiltonConfig
+  /** Optional host handler for the CORE service binding (RunDO actions). */
+  coreHandler?: (request: Request) => Promise<Response>
 }
 
 export interface BrainHandle {
@@ -32,6 +34,9 @@ export interface BrainHandle {
   ): Promise<string>
   appendEvent(event: HamiltonEvent): Promise<void>
   nextSeq(runId: string): Promise<number>
+  registryGet(key: string): Promise<string | null>
+  registryPut(key: string, value: string): Promise<void>
+  setCoreHandler(handler: (request: Request) => Promise<Response>): void
   dispose(): Promise<void>
   mf: Miniflare
 }
@@ -75,6 +80,14 @@ export async function createBrain(options: BrainOptions): Promise<BrainHandle> {
     queueProducers: { BUS: "ham-bus" },
     queueConsumers: { "ham-bus": {} },
     bindings: { CONFIG: JSON.stringify(options.config) },
+    serviceBindings: {
+      CORE: (request: Request) =>
+        coreHandlerRef.current !== undefined
+          ? coreHandlerRef.current(request)
+          : Promise.resolve(
+              new Response("no core handler registered", { status: 501 }),
+            ),
+    },
     kvPersist: options.persistDir,
     r2Persist: options.persistDir,
     durableObjectsPersist: options.persistDir,
@@ -85,6 +98,12 @@ export async function createBrain(options: BrainOptions): Promise<BrainHandle> {
   const registry = await mf.getKVNamespace("REGISTRY")
   const events = await mf.getKVNamespace("EVENTS")
   const artifacts = await mf.getR2Bucket("ARTIFACTS")
+
+  // Mutable holder so startCore can bind the dispatcher after both exist
+  // (the bus needs the brain; the brain's CORE binding needs the dispatcher).
+  const coreHandlerRef: {
+    current: ((request: Request) => Promise<Response>) | undefined
+  } = { current: options.coreHandler }
 
   return {
     async emit(event: HamiltonEvent): Promise<void> {
@@ -148,6 +167,15 @@ export async function createBrain(options: BrainOptions): Promise<BrainHandle> {
       const next = raw === null ? 1 : Number.parseInt(raw, 10) + 1
       await registry.put(counterKey, String(next))
       return next
+    },
+    async registryGet(key: string): Promise<string | null> {
+      return await registry.get(key, "text")
+    },
+    async registryPut(key: string, value: string): Promise<void> {
+      await registry.put(key, value)
+    },
+    setCoreHandler(handler: (request: Request) => Promise<Response>): void {
+      coreHandlerRef.current = handler
     },
     async dispose(): Promise<void> {
       await mf.dispose()

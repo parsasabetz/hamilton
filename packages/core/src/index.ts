@@ -1,6 +1,6 @@
 // Hamilton Core — the Bun executor (HAMILTON.md §3).
-// M1: the event spine — Miniflare brain + event bus + SSE hub + HTTP routes,
-// started via the `hamilton` CLI.
+// M2: the autonomous-execution loop — dispatcher (worktrees/sessions/merges),
+// worktree watcher (event-based git status), permission responder, live graph.
 
 import { configureSync, getConsoleSink, getLogger } from "@logtape/logtape"
 import { hamiltonEventTypes } from "@hamilton/shared"
@@ -8,18 +8,35 @@ import type { HamiltonEvent } from "@hamilton/shared"
 
 import { createBridge } from "./bridge.ts"
 import { loadConfigFile, resolveConfig } from "./config.ts"
+import { createDispatcher, createPermissionResponder } from "./dispatch.ts"
+import type { TaskSessionSpec } from "./dispatch.ts"
 import { createBus } from "./eventbus.ts"
 import type { EmitInput } from "./eventbus.ts"
+import { createControlPlane } from "./opencode.ts"
 import { createBrain } from "./runtime.ts"
 import { statusPage } from "./status-page.ts"
+import { createWorktreeWatcher } from "./worktrees.ts"
+import { worktreeSection } from "./tree-graph.ts"
+import type { BranchState } from "./tree-graph.ts"
 import type { HamiltonConfig } from "@hamilton/shared"
 
 export * from "./bridge.ts"
 export * from "./config.ts"
+export * from "./dispatch.ts"
 export * from "./eventbus.ts"
+export * from "./git.ts"
 export * from "./opencode.ts"
+export * from "./planner.ts"
 export * from "./runtime.ts"
 export * from "./status-page.ts"
+export * from "./tree-graph.ts"
+export * from "./worktrees.ts"
+export type {
+  Task,
+  TaskGraph,
+  CoreAction,
+  CoreActionResult,
+} from "@hamilton/shared"
 
 export interface CoreOptions {
   port?: number
@@ -31,6 +48,15 @@ export interface CoreOptions {
   opencodeUrl?: string
   /** Hamilton runtime config overrides (defaults apply; see shared schema). */
   config?: Partial<HamiltonConfig>
+  /** Repo the conductor provisions worktrees in (default: process.cwd()). */
+  repoRoot?: string
+  /** Parent branch task branches are created off (default: main). */
+  parent?: string
+  /** Resolves a task's session spec for dispatch (brief generation etc.). */
+  getTask?: (
+    taskId: string,
+    worktreePath?: string,
+  ) => TaskSessionSpec | undefined
 }
 
 export interface CoreHandle {
@@ -106,11 +132,69 @@ export async function startCore(
   })
 
   const opencodeUrl = options.opencodeUrl ?? process.env.HAMILTON_OPCODE_URL
+  const controlPlane = opencodeUrl
+    ? createControlPlane({ baseUrl: opencodeUrl })
+    : undefined
   const bridge = opencodeUrl
     ? createBridge({ baseUrl: opencodeUrl, runId: defaultRunId }, (event) => {
         void bus.emit(event)
       })
     : undefined
+
+  // M2: the conductor's hands — dispatcher (worktree/session/merge actions),
+  // the worktree watcher (event-based git status), and the permission
+  // auto-responder. The brain decides; the Core executes; both over the bus.
+  const repoRoot = options.repoRoot ?? process.cwd()
+  const parent = options.parent ?? process.env.HAMILTON_PARENT_BRANCH ?? "main"
+  const dispatcher = createDispatcher({
+    runId: defaultRunId,
+    repoRoot,
+    worktreesDir: config.worktreesDir,
+    parent,
+    config,
+    bus,
+    brain,
+    controlPlane,
+    getTask: options.getTask,
+  })
+  brain.setCoreHandler(async (request) => {
+    const action = (await jsonBody(
+      request,
+    )) as import("@hamilton/shared").CoreAction
+    const result = await dispatcher.handleAction(action)
+    return Response.json(result)
+  })
+
+  const watcher = createWorktreeWatcher(
+    { options: { repoRoot, worktreesDir: config.worktreesDir } },
+    (event) => {
+      void bus.emit({
+        type: "worktree.status_changed",
+        runId: defaultRunId,
+        payload: event,
+      })
+    },
+  )
+  watcher.start()
+  bus.subscribe((event) => {
+    if (event.type === "worktree.created" && isRecord(event.payload)) {
+      const branch = optionalString(event.payload, "branch")
+      const eventParent = optionalString(event.payload, "parent")
+      if (branch && eventParent) watcher.trackBranch(branch, eventParent)
+    }
+    if (event.type === "worktree.removed" && isRecord(event.payload)) {
+      const branch = optionalString(event.payload, "branch")
+      if (branch) watcher.untrackBranch(branch)
+    }
+  })
+
+  const responder = createPermissionResponder({
+    controlPlane,
+    roleForSession: () => "implementer",
+  })
+  bus.subscribe((event) => {
+    void responder.handleTelemetry(event)
+  })
 
   const server = Bun.serve({
     port,
@@ -161,6 +245,20 @@ export async function startCore(
         const snapshot = await brain.readRunState(runId)
         const tail = await bus.tail(runId, 20)
         return Response.json({ snapshot, tail })
+      }
+
+      if (url.pathname === "/api/worktrees") {
+        const runId = url.searchParams.get("run") ?? defaultRunId
+        const raw = await brain.readRunState(runId)
+        const branches = isRecord(raw)
+          ? Array.isArray(raw["branches"])
+            ? (raw["branches"] as BranchState[])
+            : []
+          : []
+        return Response.json({
+          html: worktreeSection(branches),
+          count: branches.length,
+        })
       }
 
       if (url.pathname === "/api/stream") {
@@ -224,6 +322,7 @@ export async function startCore(
     async stop(): Promise<void> {
       logger.info("Core stopping")
       bridge?.stop()
+      watcher.stop()
       server.stop(true)
       await brain.dispose()
     },

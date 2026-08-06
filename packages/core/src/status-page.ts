@@ -66,6 +66,8 @@ export function statusPage(): string {
   .conn.reconnecting { color:#facc15; }
   #tail div { padding:2px 0; color:#bbb; }
   #header { padding-bottom:0.5rem; border-bottom:1px solid #222; }
+  #worktrees svg { display:block; margin:0.5rem 0; }
+  #worktrees table td { white-space:nowrap; }
 </style>
 </head>
 <body>
@@ -75,6 +77,8 @@ export function statusPage(): string {
 <div id="tasks"></div>
 <h2>agents</h2>
 <div id="agents"></div>
+<h2>worktrees</h2>
+<div id="worktrees"><p class="dim">loading…</p></div>
 <h2>events</h2>
 <div id="tail"></div>
 <script>
@@ -82,6 +86,7 @@ var state = null
 var tail = []
 var conn = 'live'
 var TAIL_CAP = 50
+var lastWorktreesFetch = 0
 
 function esc(v) {
   return String(v == null ? '' : v)
@@ -209,11 +214,25 @@ function renderTail() {
   el.innerHTML = html
 }
 
+function renderWorktrees() {
+  var now = Date.now()
+  if (now - lastWorktreesFetch < 2000) return
+  lastWorktreesFetch = now
+  fetch('/api/worktrees')
+    .then(function (r) { return r.json() })
+    .then(function (d) {
+      var el = document.getElementById('worktrees')
+      if (el && d && typeof d.html === 'string') el.innerHTML = d.html
+    })
+    .catch(function () {})
+}
+
 function render() {
   renderHeader()
   renderTasks()
   renderAgents()
   renderTail()
+  renderWorktrees()
 }
 
 fetch('/api/state')
