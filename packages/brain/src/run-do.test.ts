@@ -601,6 +601,11 @@ const testConfig = (
   provision: { install: "auto" },
   activity: { windowMs: 120_000 },
   mergeAuthority: "owner-gated",
+  review: {
+    roles: ["correctness", "standards"],
+    vetoRoles: ["*"],
+    maxRetries: 2,
+  },
 })
 
 const autonomousConfig = (): HamiltonConfig => ({
