@@ -8,18 +8,20 @@
 
 ## Status summary
 
-| Area                                                                 | Completion | Notes                                                                                                                               |
-| -------------------------------------------------------------------- | ---------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| Toolchain (pnpm/turbo/bun/ts7/oxc/changesets/logtape/citty/husky/CI) | **100%**   | gate green, hooks active, CI covers main+dev                                                                                        |
-| Design doc (`HAMILTON.md`)                                           | **100%**   | all contracts specified                                                                                                             |
-| Contracts (`@hamilton/shared`)                                       | **100%**   | event envelope + full type table (runtime array), zod task schema, MCP tool specs                                                   |
-| OpenCode bridge (`core/src/bridge.ts`)                               | **100%**   | emits into the bus via `startCore` when `HAMILTON_OPCODE_URL` is set                                                                |
-| MCP server (`@hamilton/mcp`)                                         | **100%**   | all 6 tools emit onto the bus via the HTTP shim; checkpoint `phase` selects the event type                                          |
-| Core server                                                          | **~70%**   | event bus (seq/KV/queue/fan-out), `/api/events`, `/api/state`, SSE `/api/stream`, status page                                       |
-| Brain (Miniflare DOs)                                                | **~70%**   | RunDO (dedupe, transitions, snapshots, diff-forwarding), TaskDO/AgentDO/ReviewDO, queue consumer; AgentDO liveness alarms next (M4) |
-| Planner / dispatch / gate / merge / recovery                         | **0%**     | not started                                                                                                                         |
-| Status page                                                          | **~60%**   | header/task table/agent table/event tail, SSE live — DAG diagram + detail panels in M2/M5                                           |
-| M1 demo (`core/src/demo.ts`)                                         | **done**   | agent → MCP → bus → queue → RunDO → KV → page, incl. restart persistence                                                            |
+| Area                                                                                       | Completion | Notes                                                                                                                                                                                                                                                   |
+| ------------------------------------------------------------------------------------------ | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Toolchain (pnpm/turbo/bun/ts7/oxc/changesets/logtape/citty/husky/CI)                       | **100%**   | gate green, hooks active, CI covers main+dev                                                                                                                                                                                                            |
+| Design doc (`HAMILTON.md`)                                                                 | **100%**   | all contracts specified                                                                                                                                                                                                                                 |
+| Contracts (`@hamilton/shared`)                                                             | **100%**   | event envelope + full type table (runtime array), zod task schema, MCP tool specs, Hamilton config schema                                                                                                                                               |
+| OpenCode bridge (`core/src/bridge.ts`)                                                     | **100%**   | emits into the bus via `startCore` when `HAMILTON_OPCODE_URL` is set                                                                                                                                                                                    |
+| MCP server (`@hamilton/mcp`)                                                               | **100%**   | all 6 tools emit onto the bus via the HTTP shim; checkpoint `phase` selects the event type                                                                                                                                                              |
+| Core server                                                                                | **~75%**   | event bus, `/api/events`, `/api/state`, SSE `/api/stream`, status page; runtime config resolution + CONFIG binding                                                                                                                                      |
+| Brain (Miniflare DOs)                                                                      | **~85%**   | RunDO (dedupe, transitions, snapshots, diff-forwarding, supervision: command watch, zone violations, per-agent R2 logs, early-stop), TaskDO/AgentDO/ReviewDO, queue consumer with leases + exponential-backoff retry; AgentDO liveness alarms next (M4) |
+| Planner / dispatch / gate / merge / recovery                                               | **0%**     | not started                                                                                                                                                                                                                                             |
+| Status page                                                                                | **~60%**   | header/task table/agent table/event tail, SSE live — DAG diagram + detail panels in M2/M5                                                                                                                                                               |
+| M1 demo (`core/src/demo.ts`)                                                               | **done**   | agent → MCP → bus → queue → RunDO → KV → page, incl. restart persistence                                                                                                                                                                                |
+| Conductor session (`hamilton start`)                                                       | **~80%**   | session bootstrap (plan mode, seeded brief, server auto-spawn) — the plan-confirm-execute handoff completes with the dispatcher (M2)                                                                                                                    |
+| Supervision (command watch / zone violations / early-stop / per-agent logs / leases+retry) | **done**   | shipped ahead of schedule with the conductor requirements pass (54 brain tests)                                                                                                                                                                         |
 
 ## Remaining work by milestone
 
@@ -36,16 +38,18 @@ miniflare queue dispatch + stdio→HTTP shim are first-time integrations).
 
 ### M2 — Planner, dispatch, sessions (largest)
 
-| Task                                                                                                    | Status      |
-| ------------------------------------------------------------------------------------------------------- | ----------- |
-| `hamilton run "<prompt>"` CLI command (citty) + run config                                              | not started |
-| Deterministic planner: prompt + constants → zod-validated graph JSON → `graph.yaml` projection          | not started |
-| Brief generation (inherits `briefs/S2` format)                                                          | not started |
-| DAG traversal: gating on `merged`, parallel dispatch, merge-order enforcement                           | not started |
-| Git provisioning: worktree + branch + deps per task                                                     | not started |
-| Session lifecycle: create (role+model) → `noReply` brief → `prompt_async` → KV session registry → abort | not started |
-| Permission auto-responder (deny-by-default, per-role allowlists)                                        | not started |
-| Agent/session tables + DAG ordering on the page                                                         | not started |
+| Task                                                                                                    | Status                                                          |
+| ------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
+| `hamilton run "<prompt>"` CLI command (citty) + run config                                              | not started                                                     |
+| Deterministic planner: prompt + constants → zod-validated graph JSON → `graph.yaml` projection          | not started                                                     |
+| Brief generation (inherits `briefs/S2` format)                                                          | not started                                                     |
+| DAG traversal: gating on `merged`, parallel dispatch, merge-order enforcement                           | not started                                                     |
+| Git provisioning: worktree + branch + deps per task                                                     | not started                                                     |
+| Session lifecycle: create (role+model) → `noReply` brief → `prompt_async` → KV session registry → abort | not started                                                     |
+| Permission auto-responder (deny-by-default, per-role allowlists)                                        | not started                                                     |
+| Agent/session tables + DAG ordering on the page                                                         | not started                                                     |
+| Conductor handoff: `hamilton start` session → confirm plan → invoke the autonomous loop                 | **partial** — session bootstrap shipped; handoff completes here |
+| Early-stop integration: dispatcher honors RunDO phase `stopping`                                        | **partial** — RunDO policy shipped; dispatcher wiring here      |
 
 **Exit:** two dependent tasks run in parallel and finish in DAG order.
 

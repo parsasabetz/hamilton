@@ -96,6 +96,19 @@ Three planes, one contract — the event bus.
 - **Why one long-lived `opencode serve`:** sessions are cheap, MCP servers don't cold-boot per task, `session.create` + `prompt_async` is a fire-and-forget control surface, and the `/event` SSE stream is the single observation point for all agent activity (refs: [server docs](https://opencode.ai/docs/server/)).
 - **Why Bun:** single binary runtime for the server, SSE, and shelling out to git/opencode; `Bun.serve` and `EventSource` are built-in (ref: [Bun docs](https://bun.sh/docs)).
 
+### 3.1 How a run starts — the Conductor session
+
+`hamilton start` boots the loop as a conversation: it ensures an `opencode serve`
+is reachable (spawning one if not), creates an OpenCode session in **plan mode**
+titled `Conductor | {project name}` (title derived from the seeded prompt), and
+seeds the conductor brief (read `HAMILTON.md`/`FEATURES.md`/`ROADMAP.md`, plan —
+never edit code, confirm before executing). The user talks to the conductor to
+shape or approve a plan; **on confirmation, the conductor hands the plan to the
+autonomous loop** (`hamilton run`, the dispatch milestone), supervises outcomes
+(reviews, merges), and **reports back when the work is done or has critically
+failed** — no further human assistance until then. `hamilton dev` remains the
+bare-core server; `hamilton start` is the operator's front door.
+
 ## 4. The event-driven model
 
 ### 4.1 Rules
@@ -122,33 +135,35 @@ interface HamiltonEvent {
 
 ### 4.3 Event types
 
-| Domain    | Type                                                     | Emitted by     | Meaning                                                                       |
-| --------- | -------------------------------------------------------- | -------------- | ----------------------------------------------------------------------------- |
-| agent     | `agent.claimed`                                          | agent (MCP)    | Read the brief; plan recorded                                                 |
-| agent     | `agent.started`                                          | agent (MCP)    | First concrete action taken                                                   |
-| agent     | `agent.milestone`                                        | agent (MCP)    | File/tests/commit done; message = checkpoint                                  |
-| agent     | `agent.heartbeat`                                        | agent (MCP)    | Liveness; resets AgentDO expiry alarm                                         |
-| agent     | `agent.error`                                            | agent (MCP)    | Error + impact + recovery                                                     |
-| agent     | `agent.blocked`                                          | agent (MCP)    | Hard blocker; implies question file                                           |
-| agent     | `agent.ready_for_review`                                 | agent (MCP)    | Done; PR URL, branch, test/check status                                       |
-| agent     | `agent.subagent_spawned` / `agent.subagent_result`       | agent (MCP)    | Subagent responsibilities + outcome                                           |
-| agent     | `agent.stalled`                                          | Core bridge    | Busy session, no stream activity ≥ stallTimeout — model hung / tool stuck     |
-| agent     | `agent.idle`                                             | Core bridge    | Session turned busy → idle; RunDO pairs with task state to catch silent quits |
-| agent     | `agent.died`                                             | AgentDO alarm  | Heartbeat expired / session vanished                                          |
-| review    | `review.assigned` / `review.started`                     | RunDO          | Reviewer session dispatched                                                   |
-| review    | `review.submitted`                                       | reviewer (MCP) | Review document filed (R2 ref in payload)                                     |
-| review    | `review.verdict`                                         | RunDO          | PASS / FAIL aggregated                                                        |
-| task      | `task.dispatched`                                        | RunDO          | Session created, brief injected                                               |
-| task      | `task.status_changed`                                    | TaskDO         | Lifecycle transition                                                          |
-| task      | `task.merged`                                            | RunDO          | Owner confirmed + merge executed                                              |
-| task      | `task.escalated` / `task.blocked`                        | RunDO          | Failure handling                                                              |
-| run       | `run.planned`                                            | RunDO          | Graph rendered; dispatch begins                                               |
-| run       | `run.pause` / `run.resume` / `run.finish`                | RunDO/owner    | Run control                                                                   |
-| system    | `budget.exceeded`                                        | Core           | 50% stop-and-report line crossed                                              |
-| system    | `owner.action`                                           | Core           | Merge confirmed / question answered / override                                |
-| system    | `system.error`                                           | any            | Internal failure; always lands in R2                                          |
-| telemetry | `telemetry.opencode`                                     | Core bridge    | Raw OpenCode SSE event passthrough (audit/dashboard/RunDO policy input)       |
-| telemetry | `telemetry.stream_lost` / `telemetry.stream_reconnected` | Core bridge    | SSE observation gap — liveness data untrustworthy while down                  |
+| Domain    | Type                                                     | Emitted by      | Meaning                                                                                       |
+| --------- | -------------------------------------------------------- | --------------- | --------------------------------------------------------------------------------------------- |
+| agent     | `agent.claimed`                                          | agent (MCP)     | Read the brief; plan recorded                                                                 |
+| agent     | `agent.started`                                          | agent (MCP)     | First concrete action taken                                                                   |
+| agent     | `agent.milestone`                                        | agent (MCP)     | File/tests/commit done; message = checkpoint                                                  |
+| agent     | `agent.heartbeat`                                        | agent (MCP)     | Liveness; resets AgentDO expiry alarm                                                         |
+| agent     | `agent.error`                                            | agent (MCP)     | Error + impact + recovery                                                                     |
+| agent     | `agent.blocked`                                          | agent (MCP)     | Hard blocker; implies question file                                                           |
+| agent     | `agent.ready_for_review`                                 | agent (MCP)     | Done; PR URL, branch, test/check status                                                       |
+| agent     | `agent.subagent_spawned` / `agent.subagent_result`       | agent (MCP)     | Subagent responsibilities + outcome                                                           |
+| agent     | `agent.stalled`                                          | Core bridge     | Busy session, no stream activity ≥ stallTimeout — model hung / tool stuck                     |
+| agent     | `agent.idle`                                             | Core bridge     | Session turned busy → idle; RunDO pairs with task state to catch silent quits                 |
+| agent     | `agent.command`                                          | RunDO (derived) | Watched shell command detected in tool telemetry (e.g. `git …`); payload { command, matched } |
+| agent     | `agent.zone_violation`                                   | RunDO (derived) | File edited outside the task's zone; payload { path, taskId }                                 |
+| agent     | `agent.died`                                             | AgentDO alarm   | Heartbeat expired / session vanished                                                          |
+| review    | `review.assigned` / `review.started`                     | RunDO           | Reviewer session dispatched                                                                   |
+| review    | `review.submitted`                                       | reviewer (MCP)  | Review document filed (R2 ref in payload)                                                     |
+| review    | `review.verdict`                                         | RunDO           | PASS / FAIL aggregated                                                                        |
+| task      | `task.dispatched`                                        | RunDO           | Session created, brief injected                                                               |
+| task      | `task.status_changed`                                    | TaskDO          | Lifecycle transition                                                                          |
+| task      | `task.merged`                                            | RunDO           | Owner confirmed + merge executed                                                              |
+| task      | `task.escalated` / `task.blocked`                        | RunDO           | Failure handling                                                                              |
+| run       | `run.planned`                                            | RunDO           | Graph rendered; dispatch begins                                                               |
+| run       | `run.pause` / `run.resume` / `run.finish`                | RunDO/owner     | Run control                                                                                   |
+| system    | `budget.exceeded`                                        | Core            | 50% stop-and-report line crossed                                                              |
+| system    | `owner.action`                                           | Core            | Merge confirmed / question answered / override                                                |
+| system    | `system.error`                                           | any             | Internal failure; always lands in R2                                                          |
+| telemetry | `telemetry.opencode`                                     | Core bridge     | Raw OpenCode SSE event passthrough (audit/dashboard/RunDO policy input)                       |
+| telemetry | `telemetry.stream_lost` / `telemetry.stream_reconnected` | Core bridge     | SSE observation gap — liveness data untrustworthy while down                                  |
 
 **Why Hamilton events are not OpenCode events.** OpenCode's own `/event` stream (session.updated, message.part.updated, todo.updated, session.error, vcs.branch.updated, …) is low-level session telemetry: what happened _inside_ the tool. It has no concept of tasks, contracts, review verdicts, merges, budgets, heartbeats, or death — and it never emits "died"; a dead session is just a silent stream. Hamilton events are domain semantics (intent declared via MCP, state-machine transitions, derived liveness), so the two layers compose instead of overlap: the Core's bridge subscribes to OpenCode's stream and forwards raw telemetry as `telemetry.*` events (terminal tails, todo/session detail, permission requests, error candidates) that enrich the projections — while Hamilton events drive the decisions.
 
@@ -161,6 +176,14 @@ agent (MCP tool) ──► Core shim ──► Queue (durable buffer + retries) 
                                                                     │
                                           append artifact (R2) ◄────┴── project (KV/yaml/dashboard SSE)
 ```
+
+**Delivery semantics (leases + retry).** The queue consumer gives every event a
+**lease** (`lease:<eventId>` in KV, TTL from config): a delivery in flight is
+skipped by concurrent deliveries, and the lease is released on success or
+before a retry. Failures retry with **exponential backoff**
+(`baseDelayMs · 2^(attempts−1)`, capped at `maxDelayMs`, max `maxAttempts`);
+exhausted events land in `dead:<eventId>` for forensics. RunDO's dedupe-by-id
+plus stale-seq rejection makes reprocessing idempotent.
 
 Refs: [Queues JS APIs](https://developers.cloudflare.com/queues/configuration/javascript-apis/), [miniflare queue dispatch](https://developers.cloudflare.com/workers/testing/miniflare/get-started/).
 
@@ -327,16 +350,34 @@ Numbered end-to-end (each step cites its `.agent-state` ancestor):
 
 ## 12. Failure semantics
 
-| Scenario                   | Detection                                                                                                 | Recovery                                                                                                                                                                                                       |
-| -------------------------- | --------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Agent never starts**     | `claim-deadline` alarm (AgentDO)                                                                          | Respawn: fresh session, same brief, "inspect and continue"                                                                                                                                                     |
-| **Agent dies / quits**     | `heartbeat-expiry` alarm (AgentDO) + bridge stream loss / `agent.stalled`                                 | Abort session if alive → respawn with continue instruction (never restart from scratch — ORCHESTRATOR.md §7.4)                                                                                                 |
-| **Agent stalls mid-turn**  | bridge: busy session, no stream activity ≥ stall timeout → `agent.stalled` (model hung / tool call stuck) | Verify via `/session/status` + messages → `abort` → respawn with continue instruction; guard tool timeouts via `OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS`                                                 |
-| **Agent goes quiet**       | bridge: `agent.idle` (busy → idle) while task still in-progress with no `ready_for_review`                | RunDO pairs idle signal with task state → nudge prompt; repeated → treat as quit (§13.1 path)                                                                                                                  |
-| **Agent pauses / freezes** | `agent.stalled` + no progress events                                                                      | Owner sees `STALE` on dashboard; auto-resume via injected nudge prompt; escalate if repeated                                                                                                                   |
-| **Session breaks**         | bridge `telemetry.stream_lost` + reconnect with backoff; session registry lookup                          | Reconnect; resume via registry (session id keyed by taskId); respawn session if unrecoverable                                                                                                                  |
-| **Task fails**             | gate FAIL or `agent.error`                                                                                | `retry-once` → fresh-context agent, same branch, continue; second failure → `escalate` → mark `blocked`, gate dependents, write escalation report; unrelated parallel tasks continue (graph.yaml `on_failure`) |
-| **Orchestrator crashes**   | Core restarts; Brain persisted                                                                            | **Resumption protocol:** read KV/DO state, replay event log, restore alarms, continue the loop (ORCHESTRATOR.md §7)                                                                                            |
+| Scenario                   | Detection                                                                                                                             | Recovery                                                                                                                                                                                                       |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Many agents fail**       | RunDO bookkeeping: `failures` per agent; `shouldStop` — failed ≥ `maxFailedAgents` or failed/known ≥ `failedRatio` → phase `stopping` | Dispatch halts (no new planned→in-progress); healthy in-flight agents finish; run reports partial failure                                                                                                      |
+| **Zone violation**         | RunDO: `edit`/`write` tool telemetry with `filePath` outside the task's zone → `agent.zone_violation` + violation log                 | `zoneViolation: record` logs it (default); `warn` surfaces on the dashboard; `block` gates the task (M2)                                                                                                       |
+| **Watched command**        | RunDO: bash tool telemetry matched against `watchCommands` (default `["git"]`) → `agent.command` + command log                        | Recorded per agent — exact audit trail of every `git …` invocation                                                                                                                                             |
+| **Agent never starts**     | `claim-deadline` alarm (AgentDO)                                                                                                      | Respawn: fresh session, same brief, "inspect and continue"                                                                                                                                                     |
+| **Agent dies / quits**     | `heartbeat-expiry` alarm (AgentDO) + bridge stream loss / `agent.stalled`                                                             | Abort session if alive → respawn with continue instruction (never restart from scratch — ORCHESTRATOR.md §7.4)                                                                                                 |
+| **Agent stalls mid-turn**  | bridge: busy session, no stream activity ≥ stall timeout → `agent.stalled` (model hung / tool call stuck)                             | Verify via `/session/status` + messages → `abort` → respawn with continue instruction; guard tool timeouts via `OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS`                                                 |
+| **Agent goes quiet**       | bridge: `agent.idle` (busy → idle) while task still in-progress with no `ready_for_review`                                            | RunDO pairs idle signal with task state → nudge prompt; repeated → treat as quit (§13.1 path)                                                                                                                  |
+| **Agent pauses / freezes** | `agent.stalled` + no progress events                                                                                                  | Owner sees `STALE` on dashboard; auto-resume via injected nudge prompt; escalate if repeated                                                                                                                   |
+| **Session breaks**         | bridge `telemetry.stream_lost` + reconnect with backoff; session registry lookup                                                      | Reconnect; resume via registry (session id keyed by taskId); respawn session if unrecoverable                                                                                                                  |
+| **Task fails**             | gate FAIL or `agent.error`                                                                                                            | `retry-once` → fresh-context agent, same branch, continue; second failure → `escalate` → mark `blocked`, gate dependents, write escalation report; unrelated parallel tasks continue (graph.yaml `on_failure`) |
+| **Orchestrator crashes**   | Core restarts; Brain persisted                                                                                                        | **Resumption protocol:** read KV/DO state, replay event log, restore alarms, continue the loop (ORCHESTRATOR.md §7)                                                                                            |
+
+### 12.1 Supervision & per-agent audit logs
+
+Every agent gets an exact, append-only audit trail in R2 under
+`artifacts/<runId>/agent-<agentId>/<kind>/<seq>-<eventId>.json`:
+
+- **milestones** — every `agent.milestone` (phase, message, files, ts, seq)
+- **commands** — every watched shell command (`watchCommands` config, default `git …`), detected from bash tool-call telemetry
+- **violations** — every out-of-zone file edit (path, task zone)
+- **reports** — `ready_for_review` declarations and `subagent_result` reports
+
+Agent state is precise in the run snapshot: `claimed / started / working /
+idle / error / stalled / died / ready-for-review`, plus `failures`,
+`lastCommand`, `zoneViolations`, `milestoneCount` — the "exact bookkeeping" the
+orchestrator's early-stop policy (§12) and the status page (§15) read from.
 
 ## 13. Budget & cost control
 
