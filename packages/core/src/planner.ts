@@ -267,7 +267,7 @@ export interface ReviewBriefContext {
   parent: string
   branch: string
   worktreePath: string
-  // .hamilton/reviewer-agent.md body (constants layer) — included verbatim.
+  // .hamilton/REVIEWERS.md body (constants layer) — included verbatim.
   instructions: string
   // Deterministic READ facts summary (diff/zone/commits).
   readSummary: string

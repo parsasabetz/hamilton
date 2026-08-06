@@ -166,7 +166,7 @@ async function main(): Promise<void> {
   // Minimal constants layer so the dispatcher has reviewer instructions.
   mkdirSync(join(repoRoot, ".hamilton"), { recursive: true })
   writeFileSync(
-    join(repoRoot, ".hamilton/reviewer-agent.md"),
+    join(repoRoot, ".hamilton/REVIEWERS.md"),
     '---\ndescription: Read-only gate reviewer\ntype: agent\nmode: primary\npermission:\n  edit: deny\n  write: deny\n  apply_patch: deny\n  bash:\n    "*": deny\n    "git diff*": allow\n    "pnpm test*": allow\n    "pnpm typecheck*": allow\n    "pnpm format:check*": allow\n---\nYou are a reviewer in the Hamilton gate. You judge work; you never change it. Run the check process, write tests from the objective if missing, and file your review with the submit_review MCP tool (structured findings + verdict).\n',
   )
 

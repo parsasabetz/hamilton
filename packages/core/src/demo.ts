@@ -178,6 +178,7 @@ await client.call("notifications/initialized")
 
 const claimed = await callTool(client, "checkpoint", {
   phase: "claimed",
+  status: "working",
   message: "brief read; plan recorded",
 })
 check("checkpoint(claimed) emits", claimed.result !== undefined)
@@ -185,13 +186,33 @@ const claimedEmitted =
   isRecord(claimed.result) && claimed.result["content"] !== undefined
 check("checkpoint response", claimedEmitted)
 
-await callTool(client, "heartbeat", { note: "working on t1" })
+// The heartbeat tool was removed — aliveness is derived from checkpoints,
+// tool activity, and git. A bad phase/status combo must error with the
+// actionable matrix message.
+const bad = await callTool(client, "checkpoint", {
+  phase: "blocked",
+  status: "working",
+  message: "oops",
+})
+const badError = isRecord(bad.result) && bad.result["isError"] === true
+const badContent = isRecord(bad.result) ? bad.result["content"] : undefined
+const badText = Array.isArray(badContent)
+  ? String((badContent[0] as { text?: unknown } | undefined)?.["text"] ?? "")
+  : ""
+check(
+  "matrix violation errors with the actionable message",
+  badError && badText.includes('phase="blocked" requires status="blocked"'),
+)
+check("matrix error lists Allowed", badText.includes("Allowed:"))
+
 await callTool(client, "checkpoint", {
   phase: "started",
+  status: "working",
   message: "first edit done",
 })
 await callTool(client, "checkpoint", {
   phase: "milestone",
+  status: "working",
   message: "feature implemented; tests green",
   files: ["src/feature.ts"],
 })
@@ -217,13 +238,13 @@ check("agent a1 ready-for-review", agent?.["state"] === "ready-for-review")
 const phase = snapshot?.["phase"]
 check("run phase recorded", typeof phase === "string")
 const seq = snapshot?.["seq"]
-check("seq advanced", typeof seq === "number" && seq >= 5)
+check("seq advanced", typeof seq === "number" && seq >= 4)
 
 const tailResponse = await fetch(
   `http://localhost:${PORT}/api/events?run=${RUN_ID}&n=50`,
 )
 const tail = (await tailResponse.json()) as unknown[]
-check("event tail served", Array.isArray(tail) && tail.length >= 5)
+check("event tail served", Array.isArray(tail) && tail.length >= 4)
 
 console.log("step 5: resumption — stop core, restart on same persist dir")
 client.kill()
