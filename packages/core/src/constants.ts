@@ -9,7 +9,7 @@ import { hamiltonConfigSchema } from "@hamilton/shared"
 import type { HamiltonConfig } from "@hamilton/shared"
 
 export const CONFIG_FILENAME = "hamilton.config.ts"
-export const REVIEWER_AGENT_FILENAME = "reviewer-agent.md"
+export const REVIEWER_FILENAME = "REVIEWERS.md"
 
 export interface Frontmatter {
   /** Raw meta lines (between the --- markers), one per line. */
@@ -47,8 +47,11 @@ export interface ConstantsValidation {
 /**
  * Validate every file with a defined format inside .hamilton/:
  * - hamilton.config.ts must validate against the shared zod schema
- * - reviewer-agent.md must have parseable frontmatter (description, mode)
+ * - REVIEWERS.md must have parseable frontmatter (description, mode)
  *   and deny edits (permission.edit: deny) — reviewers are read-only
+ * - AGENTS.md must carry the implementer safety rules and the checkpoint
+ *   compatibility matrix marker
+ * - CONDUCTOR.md must carry the start_run trigger and the assistants policy
  * - other markdown files must be non-empty
  * The directory itself must exist (run `hamilton init` first).
  */
@@ -83,14 +86,14 @@ export function validateHamiltonDir(dir: string): ConstantsValidation {
     }
   }
 
-  // reviewer-agent.md — the read-only gate instructions.
-  const reviewerPath = join(dir, REVIEWER_AGENT_FILENAME)
-  if (entries.includes(REVIEWER_AGENT_FILENAME)) {
+  // REVIEWERS.md — the read-only gate instructions.
+  const reviewerPath = join(dir, REVIEWER_FILENAME)
+  if (entries.includes(REVIEWER_FILENAME)) {
     const raw = readFileSync(reviewerPath, "utf8")
     const frontmatter = parseFrontmatter(raw)
     if (frontmatter === null) {
       issues.push(
-        `${REVIEWER_AGENT_FILENAME}: must start with a --- frontmatter block`,
+        `${REVIEWER_FILENAME}: must start with a --- frontmatter block`,
       )
     } else {
       if (
@@ -98,14 +101,12 @@ export function validateHamiltonDir(dir: string): ConstantsValidation {
           /^description\s*:/.test(line.trim()),
         )
       ) {
-        issues.push(
-          `${REVIEWER_AGENT_FILENAME}: frontmatter needs a description`,
-        )
+        issues.push(`${REVIEWER_FILENAME}: frontmatter needs a description`)
       }
       if (
         !frontmatter.metaLines.some((line) => /^mode\s*:/.test(line.trim()))
       ) {
-        issues.push(`${REVIEWER_AGENT_FILENAME}: frontmatter needs a mode`)
+        issues.push(`${REVIEWER_FILENAME}: frontmatter needs a mode`)
       }
       const editAllow = frontmatter.metaLines.some((line) =>
         /edit\s*:\s*allow/.test(line.trim()),
@@ -118,12 +119,44 @@ export function validateHamiltonDir(dir: string): ConstantsValidation {
       )
       if (editAllow || (hasPermission && !editDeny)) {
         issues.push(
-          `${REVIEWER_AGENT_FILENAME}: must deny edits (permission.edit: deny) — reviewers are read-only`,
+          `${REVIEWER_FILENAME}: must deny edits (permission.edit: deny) — reviewers are read-only`,
         )
       }
       if (frontmatter.body.trim().length === 0) {
-        issues.push(`${REVIEWER_AGENT_FILENAME}: body is empty`)
+        issues.push(`${REVIEWER_FILENAME}: body is empty`)
       }
+    }
+  }
+
+  // AGENTS.md — implementer rules: the safety section and the checkpoint
+  // compatibility matrix marker (both rendered by `hamilton init`).
+  const agentsPath = join(dir, "AGENTS.md")
+  if (entries.includes("AGENTS.md")) {
+    const content = readFileSync(agentsPath, "utf8")
+    if (!content.toLowerCase().includes("safety")) {
+      issues.push(
+        'AGENTS.md: must contain the implementer safety rules ("safety")',
+      )
+    }
+    if (!content.includes("ready-for-review → complete")) {
+      issues.push(
+        'AGENTS.md: missing the checkpoint matrix marker ("ready-for-review → complete")',
+      )
+    }
+  }
+
+  // CONDUCTOR.md — orchestration rules: the start_run trigger and the
+  // assistants (subagent) policy.
+  const conductorPath = join(dir, "CONDUCTOR.md")
+  if (entries.includes("CONDUCTOR.md")) {
+    const content = readFileSync(conductorPath, "utf8")
+    if (!content.includes("start_run")) {
+      issues.push('CONDUCTOR.md: must mention "start_run" (your trigger)')
+    }
+    if (!content.includes("assistants")) {
+      issues.push(
+        'CONDUCTOR.md: must mention "assistants" (the subagent policy)',
+      )
     }
   }
 
@@ -139,9 +172,9 @@ export function validateHamiltonDir(dir: string): ConstantsValidation {
   return { ok: issues.length === 0, issues }
 }
 
-/** The reviewer's instructions (the .hamilton/reviewer-agent.md body). */
+/** The reviewer's instructions (the .hamilton/REVIEWERS.md body). */
 export function readReviewerInstructions(dir: string): string {
-  const raw = readFileSync(join(dir, REVIEWER_AGENT_FILENAME), "utf8")
+  const raw = readFileSync(join(dir, REVIEWER_FILENAME), "utf8")
   const frontmatter = parseFrontmatter(raw)
   if (frontmatter === null) return raw
   return frontmatter.body

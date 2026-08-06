@@ -22,6 +22,20 @@ permission:
 You judge work; you never change it.
 `
 
+const VALID_AGENTS = `# Agent Instructions
+
+The 6 safety rules apply.
+
+## The checkpoint compatibility matrix
+
+ready-for-review → complete
+`
+
+const VALID_CONDUCTOR = `# Conductor Instructions
+
+Your assistants never start runs. You trigger with start_run.
+`
+
 function tempDir(): string {
   return mkdtempSync(join(tmpdir(), "hamilton-constants-"))
 }
@@ -49,11 +63,12 @@ describe("validateHamiltonDir", () => {
     rmSync(dir, { recursive: true, force: true })
   })
 
-  test("valid reviewer file passes", () => {
+  test("valid constants files pass", () => {
     const dir = tempDir()
     try {
-      writeFileSync(join(dir, "reviewer-agent.md"), VALID_REVIEWER)
-      writeFileSync(join(dir, "CONDUCTOR.md"), "# conductor\n")
+      writeFileSync(join(dir, "REVIEWERS.md"), VALID_REVIEWER)
+      writeFileSync(join(dir, "AGENTS.md"), VALID_AGENTS)
+      writeFileSync(join(dir, "CONDUCTOR.md"), VALID_CONDUCTOR)
       const result = validateHamiltonDir(dir)
       expect(result.ok).toBe(true)
       expect(result.issues).toEqual([])
@@ -66,7 +81,7 @@ describe("validateHamiltonDir", () => {
     const dir = tempDir()
     try {
       writeFileSync(
-        join(dir, "reviewer-agent.md"),
+        join(dir, "REVIEWERS.md"),
         "---\ndescription: x\nmode: primary\npermission:\n  edit: allow\n---\nbody",
       )
       const result = validateHamiltonDir(dir)
@@ -88,13 +103,85 @@ describe("validateHamiltonDir", () => {
       rmSync(dir, { recursive: true, force: true })
     }
   })
+
+  test("flags AGENTS.md without the safety rules", () => {
+    const dir = tempDir()
+    try {
+      writeFileSync(join(dir, "AGENTS.md"), "# implementer notes\n\nno rules\n")
+      const result = validateHamiltonDir(dir)
+      expect(result.ok).toBe(false)
+      expect(
+        result.issues.some(
+          (i) => i.includes("AGENTS.md") && i.includes("safety"),
+        ),
+      ).toBe(true)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("flags AGENTS.md without the matrix marker", () => {
+    const dir = tempDir()
+    try {
+      writeFileSync(
+        join(dir, "AGENTS.md"),
+        "safety rules: stay safe\n\nclaimed → working\n",
+      )
+      const result = validateHamiltonDir(dir)
+      expect(result.ok).toBe(false)
+      expect(
+        result.issues.some(
+          (i) =>
+            i.includes("AGENTS.md") &&
+            i.includes("ready-for-review → complete"),
+        ),
+      ).toBe(true)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("flags CONDUCTOR.md without start_run", () => {
+    const dir = tempDir()
+    try {
+      writeFileSync(
+        join(dir, "CONDUCTOR.md"),
+        "Your assistants are read-only.\n",
+      )
+      const result = validateHamiltonDir(dir)
+      expect(result.ok).toBe(false)
+      expect(
+        result.issues.some(
+          (i) => i.includes("CONDUCTOR.md") && i.includes("start_run"),
+        ),
+      ).toBe(true)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("flags CONDUCTOR.md without assistants", () => {
+    const dir = tempDir()
+    try {
+      writeFileSync(join(dir, "CONDUCTOR.md"), "You trigger with start_run.\n")
+      const result = validateHamiltonDir(dir)
+      expect(result.ok).toBe(false)
+      expect(
+        result.issues.some(
+          (i) => i.includes("CONDUCTOR.md") && i.includes("assistants"),
+        ),
+      ).toBe(true)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
 })
 
 describe("readReviewerInstructions", () => {
   test("returns the body without the frontmatter", () => {
     const dir = tempDir()
     try {
-      writeFileSync(join(dir, "reviewer-agent.md"), VALID_REVIEWER)
+      writeFileSync(join(dir, "REVIEWERS.md"), VALID_REVIEWER)
       expect(readReviewerInstructions(dir)).toBe(
         "You judge work; you never change it.\n",
       )

@@ -44,6 +44,9 @@ importers:
       '@hamilton/core':
         specifier: workspace:*
         version: link:../core
+      '@hamilton/shared':
+        specifier: workspace:*
+        version: link:../shared
       citty:
         specifier: ^0.2.2
         version: 0.2.2

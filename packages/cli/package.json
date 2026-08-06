@@ -16,6 +16,7 @@
   },
   "dependencies": {
     "@hamilton/core": "workspace:*",
+    "@hamilton/shared": "workspace:*",
     "citty": "^0.2.2"
   },
   "devDependencies": {
