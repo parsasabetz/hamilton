@@ -31,6 +31,9 @@ export const hamiltonEventTypes = [
   // agent domain — bridge-derived liveness (from the OpenCode SSE stream)
   "agent.stalled",
   "agent.idle",
+  // agent domain — derived supervision (from tool-call telemetry)
+  "agent.command",
+  "agent.zone_violation",
   // review domain
   "review.assigned",
   "review.started",
@@ -97,6 +100,41 @@ export const taskSchema = z.object({
 })
 
 export type Task = z.infer<typeof taskSchema>
+
+// HAMILTON.md §"Runtime config" — the constants layer's runtime configuration.
+// Validated once in the Core; the brain receives it as a JSON binding.
+
+export const hamiltonConfigSchema = z.object({
+  /** Bash command prefixes to record as agent.command (e.g. ["git"]). */
+  watchCommands: z.array(z.string()).default(["git"]),
+  /** Zone-violation policy: record | warn | block (block wired in M2). */
+  zoneViolation: z.enum(["record", "warn", "block"]).default("record"),
+  /** Early-stop policy: when enough agents fail, halt dispatch after healthy
+   *  agents finish (whichever threshold trips first). */
+  earlyStop: z
+    .object({
+      enabled: z.boolean(),
+      maxFailedAgents: z.number().int().positive(),
+      failedRatio: z.number().min(0).max(1),
+    })
+    .default({ enabled: true, maxFailedAgents: 2, failedRatio: 0.5 }),
+  /** Queue event delivery: retry with exponential backoff, capped. */
+  eventRetry: z
+    .object({
+      maxAttempts: z.number().int().positive(),
+      baseDelayMs: z.number().int().positive(),
+      maxDelayMs: z.number().int().positive(),
+    })
+    .default({ maxAttempts: 3, baseDelayMs: 1000, maxDelayMs: 30_000 }),
+  /** Lease TTL for in-flight event processing (double-delivery guard). */
+  leaseTtlMs: z.number().int().positive().default(60_000),
+})
+
+export type HamiltonConfig = z.infer<typeof hamiltonConfigSchema>
+
+export const defaultHamiltonConfig: HamiltonConfig = hamiltonConfigSchema.parse(
+  {},
+)
 
 // HAMILTON.md §7 — the agent-facing MCP tool surface.
 

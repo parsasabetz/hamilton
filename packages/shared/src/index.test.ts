@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { taskSchema } from "./index.ts"
+import { hamiltonConfigSchema, taskSchema } from "./index.ts"
 
 const validTask = {
   id: "t1",
@@ -43,5 +43,54 @@ describe("taskSchema", () => {
       pr_title: "feat(t1): do the thing",
     })
     expect(parsed.success).toBe(true)
+  })
+})
+
+describe("hamiltonConfigSchema", () => {
+  test("defaults apply when parsing an empty object", () => {
+    const cfg = hamiltonConfigSchema.parse({})
+    expect(cfg.watchCommands).toEqual(["git"])
+    expect(cfg.zoneViolation).toBe("record")
+    expect(cfg.earlyStop).toEqual({
+      enabled: true,
+      maxFailedAgents: 2,
+      failedRatio: 0.5,
+    })
+    expect(cfg.eventRetry).toEqual({
+      maxAttempts: 3,
+      baseDelayMs: 1000,
+      maxDelayMs: 30_000,
+    })
+    expect(cfg.leaseTtlMs).toBe(60_000)
+  })
+
+  test("overrides merge onto defaults", () => {
+    const cfg = hamiltonConfigSchema.parse({
+      watchCommands: ["git", "npm"],
+      earlyStop: { enabled: false, maxFailedAgents: 5, failedRatio: 0.3 },
+    })
+    expect(cfg.watchCommands).toEqual(["git", "npm"])
+    expect(cfg.earlyStop).toEqual({
+      enabled: false,
+      maxFailedAgents: 5,
+      failedRatio: 0.3,
+    })
+    expect(cfg.eventRetry.maxAttempts).toBe(3)
+  })
+
+  test("rejects invalid values", () => {
+    expect(hamiltonConfigSchema.safeParse({ leaseTtlMs: -1 }).success).toBe(
+      false,
+    )
+    expect(
+      hamiltonConfigSchema.safeParse({
+        earlyStop: { enabled: true, maxFailedAgents: 0, failedRatio: 0.5 },
+      }).success,
+    ).toBe(false)
+    expect(
+      hamiltonConfigSchema.safeParse({
+        earlyStop: { enabled: true, maxFailedAgents: 2, failedRatio: 1.5 },
+      }).success,
+    ).toBe(false)
   })
 })
