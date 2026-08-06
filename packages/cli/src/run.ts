@@ -10,6 +10,7 @@ import {
   createControlPlane,
   decomposeWithOpencode,
   loadConfigFile,
+  validateHamiltonDir,
   planFromFile,
   planFromPrompt,
   renderBrief,
@@ -233,6 +234,15 @@ export async function runHamilton(options: RunOptions): Promise<RunResult> {
   const repoRoot = options.repoRoot ?? process.cwd()
   const runId = options.runId ?? `run-${Date.now()}`
   const port = options.port ?? DEFAULT_PORT
+
+  // The constants layer must be valid before the loop trusts it (HAMILTON.md §6).
+  const validation = validateHamiltonDir(repoRoot)
+  if (!validation.ok) {
+    throw new Error(
+      "invalid .hamilton constants:\n" +
+        validation.issues.map((issue) => `  - ${issue}`).join("\n"),
+    )
+  }
 
   const loaded = await loadConfigFile(repoRoot)
   const config =

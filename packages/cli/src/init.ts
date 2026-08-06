@@ -6,7 +6,7 @@
 // Renders pure templates; never overwrites existing files.
 
 import { mkdirSync, writeFileSync } from "node:fs"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 
 export interface InitFiles {
   [path: string]: string
@@ -87,12 +87,65 @@ export default {
 
   // Lease TTL for in-flight event processing (double-delivery guard), ms.
   // leaseTtlMs: 60000,
+
+  // Review gate: one session per role; "*" in vetoRoles = every role vetoes
+  // (fail-closed); non-vetoed roles' findings route back as notes.
+  // review: {
+  //   roles: ["correctness", "standards"],
+  //   vetoRoles: ["*"],
+  //   maxRetries: 2,
+  // },
 }
+`
+
+export const REVIEWER_AGENT_MD = `---
+description: Read-only gate reviewer — checks the task contract, runs the check process, writes structured findings
+mode: primary
+permission:
+  edit: deny
+  write: deny
+  apply_patch: deny
+  bash:
+    "*": deny
+    "git diff*": allow
+    "git log*": allow
+    "git show*": allow
+    "git status*": allow
+    "git branch*": allow
+    "git rev-parse*": allow
+    "pnpm test*": allow
+    "pnpm typecheck*": allow
+    "pnpm format:check*": allow
+    "pnpm lint*": allow
+    "npm test*": allow
+    "npm run typecheck*": allow
+    "npm run lint*": allow
+    "bun test*": allow
+    "bun run typecheck*": allow
+    "bun run lint*": allow
+    "grep*": allow
+    "rg*": allow
+---
+
+You are a **reviewer** in the Hamilton gate (HAMILTON.md §11). You judge work; you never change it.
+
+Your job, per the brief:
+1. Read the task contract (inputs/outputs, zone) and the factual READ summary.
+2. Inspect the branch's diff against the parent (\`git diff <parent>...<branch>\`, \`git log\`).
+3. Run the check process in the review worktree: typecheck → format:check → tests → hooks, per the project's toolchain.
+4. Write tests from the task objective if they are missing, and run them.
+5. Report findings with exact locations and suggested fixes.
+
+File your review with the \`submit_review\` MCP tool: structured findings
+(\`id\`, \`location\`, \`issue\`, \`suggested_fix\`), the checks you ran with results,
+tests you wrote, and a verdict. Findings are what the orchestrator decides on —
+be specific, not vague.
 `
 
 export const DEFAULT_INIT_FILES: InitFiles = {
   ".hamilton/CONDUCTOR.md": CONDUCTOR_MD,
   ".hamilton/AGENTS.md": AGENTS_MD,
+  ".hamilton/reviewer-agent.md": REVIEWER_AGENT_MD,
   "hamilton.config.ts": CONFIG_TS,
 }
 
@@ -101,14 +154,14 @@ export interface InitResult {
   skipped: string[]
 }
 
-/** Create .hamilton/ + hamilton.config.ts in dir. Never overwrites. */
+/** Create the constants layer in dir (.hamilton/, .opencode/agents/, config). Never overwrites. */
 export function initProject(dir: string): InitResult {
-  mkdirSync(join(dir, ".hamilton"), { recursive: true })
   const created: string[] = []
   const skipped: string[] = []
   for (const [relative, content] of Object.entries(DEFAULT_INIT_FILES)) {
     const path = join(dir, relative)
     try {
+      mkdirSync(dirname(path), { recursive: true })
       writeFileSync(path, content, { flag: "wx" })
       created.push(relative)
     } catch (error) {

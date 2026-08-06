@@ -22,6 +22,7 @@ import type { HamiltonConfig } from "@hamilton/shared"
 
 export * from "./bridge.ts"
 export * from "./config.ts"
+export * from "./constants.ts"
 export * from "./dispatch.ts"
 export * from "./eventbus.ts"
 export * from "./git.ts"

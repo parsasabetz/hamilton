@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test"
-import { hamiltonConfigSchema, taskGraphSchema, taskSchema } from "./index.ts"
+import {
+  hamiltonConfigSchema,
+  hamiltonToolSpecs,
+  taskGraphSchema,
+  taskSchema,
+} from "./index.ts"
 
 const validTask = {
   id: "t1",
@@ -146,5 +151,59 @@ describe("hamiltonConfigSchema M2 additions", () => {
     expect(cfg.provision.install).toBe("skip")
     expect(cfg.activity.windowMs).toBe(60_000)
     expect(cfg.mergeAuthority).toBe("autonomous")
+  })
+})
+
+describe("hamiltonConfigSchema M3 review block", () => {
+  test("defaults: two roles, all veto, 2 retries", () => {
+    const cfg = hamiltonConfigSchema.parse({})
+    expect(cfg.review).toEqual({
+      roles: ["correctness", "standards"],
+      vetoRoles: ["*"],
+      maxRetries: 2,
+    })
+  })
+
+  test("accepts role/veto overrides", () => {
+    const cfg = hamiltonConfigSchema.parse({
+      review: {
+        roles: ["security", "correctness", "style"],
+        vetoRoles: ["security"],
+        maxRetries: 3,
+        model: "opencode-go/deepseek-v4-flash",
+      },
+    })
+    expect(cfg.review.vetoRoles).toEqual(["security"])
+    expect(cfg.review.roles).toHaveLength(3)
+    expect(cfg.review.model).toBe("opencode-go/deepseek-v4-flash")
+  })
+})
+
+describe("submit_review tool spec", () => {
+  test("validates the structured-findings contract", () => {
+    const spec = hamiltonToolSpecs.find((s) => s.name === "submit_review")
+    expect(spec).toBeDefined()
+    const parsed = spec!.inputSchema.safeParse({
+      reviewer: "security",
+      verdict: "fail",
+      findings: [
+        {
+          id: "SEC-001",
+          location: "api/login.ts:42",
+          issue: "User input reaches query directly",
+          suggested_fix: "Use parameterized query",
+        },
+      ],
+    })
+    expect(parsed.success).toBe(true)
+    const data = parsed.data as { findings?: Array<{ id: string }> } | undefined
+    expect(data?.findings?.[0]?.id).toBe("SEC-001")
+  })
+
+  test("rejects a bad verdict", () => {
+    const spec = hamiltonToolSpecs.find((s) => s.name === "submit_review")!
+    expect(
+      spec.inputSchema.safeParse({ reviewer: "x", verdict: "maybe" }).success,
+    ).toBe(false)
   })
 })

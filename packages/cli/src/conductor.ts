@@ -2,7 +2,7 @@
 // the user talks to (HAMILTON.md §8, Conductor plane).
 
 import { basename } from "node:path"
-import { createControlPlane } from "@hamilton/core"
+import { createControlPlane, validateHamiltonDir } from "@hamilton/core"
 
 const DEFAULT_OPCODE_URL = "http://localhost:4096"
 const SERVER_PORT = "4096"
@@ -77,6 +77,17 @@ export async function startConductor(
   const projectName = options.projectName ?? basename(process.cwd())
   const baseUrl =
     options.baseUrl ?? process.env.HAMILTON_OPCODE_URL ?? DEFAULT_OPCODE_URL
+
+  // The constants layer must be valid before the conductor can trust it
+  // (HAMILTON.md §6) — malformed .hamilton files fail the start.
+  const validation = validateHamiltonDir(process.cwd())
+  if (!validation.ok) {
+    throw new Error(
+      "invalid .hamilton constants:\n" +
+        validation.issues.map((issue) => `  - ${issue}`).join("\n"),
+    )
+  }
+
   const cp = createControlPlane({ baseUrl })
 
   let child: ReturnType<typeof Bun.spawn> | undefined

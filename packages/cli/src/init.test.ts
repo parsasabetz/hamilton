@@ -20,6 +20,7 @@ describe("initProject", () => {
       expect(result.skipped).toEqual([])
       expect(result.created).toContain(".hamilton/CONDUCTOR.md")
       expect(result.created).toContain(".hamilton/AGENTS.md")
+      expect(result.created).toContain(".hamilton/reviewer-agent.md")
       expect(result.created).toContain("hamilton.config.ts")
 
       const conductor = readFileSync(
@@ -32,7 +33,7 @@ describe("initProject", () => {
       const agents = readFileSync(join(dir, ".hamilton/AGENTS.md"), "utf8")
       expect(agents).toContain("heartbeat")
       expect(agents).toContain("ready_for_review")
-      expect(agents).toContain("never `git add -A`")
+      expect(agents).toContain("Never `git add -A`")
 
       const config = readFileSync(join(dir, "hamilton.config.ts"), "utf8")
       expect(config).toContain("export default")
@@ -46,7 +47,7 @@ describe("initProject", () => {
     const dir = tempDir()
     try {
       const first = initProject(dir)
-      expect(first.created).toHaveLength(3)
+      expect(first.created).toHaveLength(4)
 
       const second = initProject(dir)
       expect(second.created).toEqual([])

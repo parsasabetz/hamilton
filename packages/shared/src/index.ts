@@ -144,6 +144,28 @@ export type CoreAction =
       taskId: string
     }
   | {
+      action: "session.nudge"
+      runId: string
+      taskId: string
+      message: string
+    }
+  | {
+      action: "review.start"
+      runId: string
+      taskId: string
+      branch: string
+      parent: string
+      roles: string[]
+      model?: string
+      /** Task zone — the dispatcher's deterministic READ checks diff paths. */
+      zone: string[]
+    }
+  | {
+      action: "review.cleanup"
+      runId: string
+      taskId: string
+    }
+  | {
       action: "merge.execute"
       runId: string
       taskId: string
@@ -157,6 +179,8 @@ export type CoreActionResult =
       worktreePath?: string
       sessionId?: string
       mergeCommit?: string
+      reviewerSessionIds?: string[]
+      reviewWorktreePath?: string
     }
   | { ok: false; error: string }
 
@@ -207,6 +231,26 @@ export const hamiltonConfigSchema = z.object({
   /** Merge authority: "autonomous" executes merges on ready_for_review;
    *  "owner-gated" waits for the owner (D2 default; M2 demo passes autonomous). */
   mergeAuthority: z.enum(["autonomous", "owner-gated"]).default("owner-gated"),
+  /** Review gate (M3): reviewer roles, veto weights, retry cap. */
+  review: z
+    .object({
+      /** Reviewer roles dispatched per gate (one session each), e.g.
+       *  ["correctness", "standards", "security"]. */
+      roles: z.array(z.string()),
+      /** Roles whose "fail" verdict vetoes the merge. ["*"] = every role
+       *  vetoes (fail-closed, the default); a non-vetoed role's findings
+       *  still route back to the agent as notes. */
+      vetoRoles: z.array(z.string()),
+      /** Rejections before the task is blocked + escalated. */
+      maxRetries: z.number().int().positive(),
+      /** Model for reviewer sessions (default: the task's model). */
+      model: z.string().optional(),
+    })
+    .default({
+      roles: ["correctness", "standards"],
+      vetoRoles: ["*"],
+      maxRetries: 2,
+    }),
 })
 
 export type HamiltonConfig = z.infer<typeof hamiltonConfigSchema>
@@ -224,6 +268,7 @@ export const hamiltonToolNames = [
   "ask_question",
   "report_subagent",
   "ready_for_review",
+  "submit_review",
 ] as const
 
 export type HamiltonToolName = (typeof hamiltonToolNames)[number]
@@ -292,4 +337,51 @@ export const hamiltonToolSpecs: HamiltonToolSpec[] = [
       checks: z.record(z.string(), z.unknown()).optional(),
     }),
   },
+  {
+    name: "submit_review",
+    description:
+      "File a structured review: role, verdict, and findings (id, location, issue, suggested fix).",
+    inputSchema: z.object({
+      reviewer: z
+        .string()
+        .describe("Reviewer role assigned by the orchestrator"),
+      verdict: z.enum(["pass", "fail"]),
+      findings: z
+        .array(
+          z.object({
+            id: z.string().describe("Finding id, e.g. SEC-001"),
+            location: z.string().describe("File:line, e.g. api/login.ts:42"),
+            issue: z.string(),
+            suggested_fix: z.string().optional(),
+          }),
+        )
+        .default([]),
+      checksRun: z
+        .array(z.object({ name: z.string(), ok: z.boolean() }))
+        .optional(),
+      testsWritten: z.array(z.string()).optional(),
+      summary: z.string().optional(),
+    }),
+  },
 ]
+
+// M3 — the review contract (structured findings; verdicts derive from them).
+
+export interface ReviewFinding {
+  id: string
+  location: string
+  issue: string
+  suggested_fix?: string
+}
+
+export interface ReviewSubmission {
+  /** Reviewer role (from config review.roles), e.g. "security". */
+  reviewer: string
+  /** Session index within the review batch. */
+  idx: number
+  verdict: "pass" | "fail"
+  findings: ReviewFinding[]
+  checksRun?: Array<{ name: string; ok: boolean }>
+  testsWritten?: string[]
+  summary?: string
+}
