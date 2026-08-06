@@ -24,6 +24,8 @@ export interface Env {
   ARTIFACTS: R2Bucket
   BUS: Queue<unknown>
   CONFIG: string
+  /** Host-callback service binding — RunDO issues CoreAction requests here. */
+  CORE: Fetcher
 }
 
 // The Core validates the config with zod once; the brain trusts it and only
