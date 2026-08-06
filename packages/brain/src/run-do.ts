@@ -18,6 +18,8 @@ import type {
   CoreActionResult,
   HamiltonConfig,
   HamiltonEvent,
+  ReviewFinding,
+  ReviewSubmission,
   Task,
   TaskStatus,
 } from "@hamilton/shared"
@@ -40,6 +42,18 @@ const KEYS = {
 const DEDUPE_TTL_SECONDS = 86_400
 const ISSUED_TTL_SECONDS = 86_400
 
+// M3 — one reviewer session within a gate round (review.assigned/submitted).
+export interface ReviewerEntry {
+  idx: number
+  role: string
+  sessionId?: string
+  verdict?: "pass" | "fail"
+  submittedAt?: string
+  /** Findings from this reviewer's submission(s), used to rebuild the
+   *  ReviewSubmission list for decideGate once every reviewer has voted. */
+  findings?: ReviewFinding[]
+}
+
 export interface TaskRunState {
   id: string
   status: TaskStatus
@@ -47,8 +61,18 @@ export interface TaskRunState {
   branch?: string
   zone: string[]
   dependsOn?: string[]
+  contract?: { inputs: string[]; outputs: string[] }
   lastEventType?: string
   lastEventAt?: string
+  /** M3 gate state (see review.* events). */
+  reviewers?: ReviewerEntry[]
+  /** Rejection count — a gate round's fail verdicts; maxRetries blocks. */
+  reviewRetries?: number
+  /** Review worktree (review.assigned worktreePath) — cleaned up once the
+   *  task leaves the gate (approved/blocked). */
+  reviewWorktreePath?: string
+  /** All findings accumulated across reviewers since the last fresh gate. */
+  reviewFindings?: ReviewFinding[]
 }
 
 export interface AgentRunState {
@@ -311,16 +335,17 @@ export function dispatchCandidates(
 
 // ── M2: merge gating (HAMILTON.md §"Merge authority") ───────────────────────
 //
-// Autonomous runs merge the moment a task is ready_for_review; owner-gated
-// runs hold for the owner board (M3 governance), so no merge is triggered
-// here.
+// M3 rewired the gate: a task merges only once it is "approved" (review passed)
+// AND the run is autonomous; ready_for_review now enters the review gate
+// instead of merging directly. Owner-gated runs hold for the owner board
+// (M3 governance), so no merge is triggered here.
 export function shouldMerge(
   snapshot: RunSnapshot,
   taskId: string,
   config: HamiltonConfig,
 ): boolean {
   if (config.mergeAuthority !== "autonomous") return false
-  return snapshot.tasks[taskId]?.status === "ready-for-review"
+  return snapshot.tasks[taskId]?.status === "approved"
 }
 
 export interface MergeTarget {
@@ -344,12 +369,59 @@ export function mergeTrigger(
   return targets
 }
 
-// ── M2: action issuance (the RunDO loop's decision output) ──────────────────
+// ── M3: the gate decision (HAMILTON.md §"Review gate") ──────────────────────
+//
+// Pure policy over the batch of submissions for one gate round. A role vetoes
+// when config.review.vetoRoles contains "*" (every role vetoes) or the role
+// name. One veto-role "fail" fails the gate; its findings are the blockers.
+// Non-veto ("advisory") fails only land in notes. Fail-closed: no submissions
+// at all → fail.
+
+export interface GateDecision {
+  verdict: "pass" | "fail"
+  /** Findings from veto-role fail reviewers (routed back as blockers). */
+  blockers: ReviewFinding[]
+  /** All other findings (pass reviewers + advisory fails). */
+  notes: ReviewFinding[]
+}
+
+export function decideGate(
+  submissions: ReviewSubmission[],
+  config: HamiltonConfig,
+): GateDecision {
+  if (submissions.length === 0) {
+    return { verdict: "fail", blockers: [], notes: [] }
+  }
+  const vetoRoles = config.review.vetoRoles
+  let vetoFailed = false
+  const blockers: ReviewFinding[] = []
+  const notes: ReviewFinding[] = []
+  for (const submission of submissions) {
+    const vetoes =
+      vetoRoles.includes("*") || vetoRoles.includes(submission.reviewer)
+    if (submission.verdict === "fail" && vetoes) {
+      vetoFailed = true
+      blockers.push(...submission.findings)
+    } else {
+      notes.push(...submission.findings)
+    }
+  }
+  return { verdict: vetoFailed ? "fail" : "pass", blockers, notes }
+}
+
+// ── M2/M3: action issuance (the RunDO loop's decision output) ───────────────
 //
 // One CoreAction per task per category, nothing while stopping/finished:
 //   - worktree.ensure for every dispatch candidate (branch defaults to
 //     `feat/${taskId}` when the graph carries none);
-//   - merge.execute for every merge trigger.
+//   - review.start for every ready-for-review task whose gate has not been
+//     populated yet (fresh gate; a rejection resets reviewers in applyEvent,
+//     so the gate re-runs after fixes);
+//   - merge.execute for every approved task (autonomous runs only — the M2
+//     ready→merge path was replaced by the M3 gate);
+//   - session.nudge for rejected tasks so the agent gets its findings back;
+//   - review.cleanup once an approved/blocked task leaves the gate with a
+//     review worktree still provisioned.
 // session.start/abort are NOT issued here: the Core dispatcher issues
 // session.start once a worktree.ensure has resolved (and session.abort on
 // escalation), so the RunDO stays a pure decision-maker.
@@ -372,19 +444,89 @@ export function actionsFor(
       branch: task.branch ?? `feat/${candidate.taskId}`,
     })
   }
-  const merged = new Set<string>()
-  for (const target of mergeTrigger(snapshot, config)) {
-    if (merged.has(target.taskId)) continue
-    merged.add(target.taskId)
-    actions.push({
-      action: "merge.execute",
-      runId: snapshot.runId ?? "",
-      taskId: target.taskId,
-      branch: target.branch,
-      parent: target.parent,
-    })
+  const runId = snapshot.runId ?? ""
+  const parent = snapshot.parent ?? ""
+  // One action per (taskId, action), priority order: review.start →
+  // merge.execute → session.nudge → review.cleanup.
+  const issued = new Set<string>()
+  const issue = (action: CoreAction): void => {
+    const key = `${action.taskId}:${action.action}`
+    if (issued.has(key)) return
+    issued.add(key)
+    actions.push(action)
+  }
+  for (const [taskId, task] of Object.entries(snapshot.tasks)) {
+    if (
+      task.status === "ready-for-review" &&
+      (task.reviewers === undefined || task.reviewers.length === 0)
+    ) {
+      issue({
+        action: "review.start",
+        runId,
+        taskId,
+        branch: task.branch ?? `feat/${taskId}`,
+        parent,
+        roles: config.review.roles,
+        ...(config.review.model !== undefined
+          ? { model: config.review.model }
+          : {}),
+        zone: task.zone,
+        ...(task.contract !== undefined ? { contract: task.contract } : {}),
+      })
+    }
+    if (
+      task.status === "approved" &&
+      config.mergeAuthority === "autonomous" &&
+      snapshot.parent !== undefined &&
+      task.branch !== undefined
+    ) {
+      issue({
+        action: "merge.execute",
+        runId,
+        taskId,
+        branch: task.branch,
+        parent: snapshot.parent,
+      })
+    }
+    if (
+      task.status === "in-progress" &&
+      (task.reviewRetries ?? 0) > 0 &&
+      (task.reviewFindings ?? []).length > 0 &&
+      snapshot.phase !== "stopping"
+    ) {
+      issue({
+        action: "session.nudge",
+        runId,
+        taskId,
+        message: renderNudgeMessage(task),
+      })
+    }
+    if (
+      (task.status === "approved" || task.status === "blocked") &&
+      task.reviewWorktreePath !== undefined
+    ) {
+      issue({
+        action: "review.cleanup",
+        runId,
+        taskId,
+      })
+    }
   }
   return actions
+}
+
+// Compact findings digest for the agent after a rejected gate round: the
+// accumulated findings (capped at 20) rendered as one line per finding.
+function renderNudgeMessage(task: TaskRunState): string {
+  const findings = (task.reviewFindings ?? []).slice(0, 20)
+  const lines = findings.map(
+    (finding) =>
+      `- [${finding.id}] ${finding.location}: ${finding.issue}` +
+      (finding.suggested_fix !== undefined
+        ? ` (suggested: ${finding.suggested_fix})`
+        : ""),
+  )
+  return `Review rejected (attempt ${task.reviewRetries ?? 0}). Findings:\n${lines.join("\n")}`
 }
 
 // Best-effort parse of a full Task (from task.dispatched payload) for the `graph`
@@ -487,6 +629,66 @@ function withTaskStatus(
   return patchTask(snapshot, taskId, { status })
 }
 
+// M3 — reviewer rows from a review.assigned payload. Skips malformed entries
+// (missing idx/role); returns undefined when nothing parses.
+function parseReviewers(value: unknown): ReviewerEntry[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const reviewers: ReviewerEntry[] = []
+  for (const item of value) {
+    if (typeof item !== "object" || item === null) continue
+    const record = item as Record<string, unknown>
+    if (typeof record.idx !== "number") continue
+    if (typeof record.role !== "string") continue
+    const entry: ReviewerEntry = { idx: record.idx, role: record.role }
+    if (typeof record.sessionId === "string") entry.sessionId = record.sessionId
+    reviewers.push(entry)
+  }
+  return reviewers.length > 0 ? reviewers : undefined
+}
+
+// M3 — findings from a review.submitted payload. Skips malformed findings;
+// returns undefined when none parse (accumulation is append-only).
+function parseFindings(value: unknown): ReviewFinding[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const findings: ReviewFinding[] = []
+  for (const item of value) {
+    if (typeof item !== "object" || item === null) continue
+    const record = item as Record<string, unknown>
+    if (typeof record.id !== "string") continue
+    if (typeof record.location !== "string") continue
+    if (typeof record.issue !== "string") continue
+    const finding: ReviewFinding = {
+      id: record.id,
+      location: record.location,
+      issue: record.issue,
+    }
+    if (typeof record.suggested_fix === "string") {
+      finding.suggested_fix = record.suggested_fix
+    }
+    findings.push(finding)
+  }
+  return findings.length > 0 ? findings : undefined
+}
+
+// M3 — drop optional gate fields from a task row (fresh gate after a
+// rejection; exactOptionalPropertyTypes forbids assigning undefined).
+function clearTaskFields(
+  snapshot: RunSnapshot,
+  taskId: string,
+  fields: readonly (
+    | "reviewers"
+    | "reviewRetries"
+    | "reviewWorktreePath"
+    | "reviewFindings"
+  )[],
+): RunSnapshot {
+  const existing = snapshot.tasks[taskId]
+  if (existing === undefined) return snapshot
+  const task: TaskRunState = { ...existing }
+  for (const field of fields) delete task[field]
+  return setTask(snapshot, task)
+}
+
 function setBranch(snapshot: RunSnapshot, row: BranchRunState): RunSnapshot {
   return {
     ...snapshot,
@@ -532,6 +734,21 @@ export function applyEvent(
             stringArray(record.depends_on) ?? existing?.dependsOn ?? []
           const branch =
             typeof record.branch === "string" ? record.branch : existing?.branch
+          const contract =
+            typeof record.contract === "object" && record.contract !== null
+              ? (record.contract as { inputs?: unknown; outputs?: unknown })
+              : undefined
+          const contractParsed =
+            contract !== undefined &&
+            Array.isArray(contract.inputs) &&
+            contract.inputs.every((i) => typeof i === "string") &&
+            Array.isArray(contract.outputs) &&
+            contract.outputs.every((o) => typeof o === "string")
+              ? {
+                  inputs: contract.inputs as string[],
+                  outputs: contract.outputs as string[],
+                }
+              : existing?.contract
           tasks[record.id] = {
             ...existing,
             id: record.id,
@@ -540,6 +757,9 @@ export function applyEvent(
             zone,
             dependsOn,
             ...(branch !== undefined ? { branch } : {}),
+            ...(contractParsed !== undefined
+              ? { contract: contractParsed }
+              : {}),
           }
         }
         next = { ...next, tasks }
@@ -721,6 +941,19 @@ export function applyEvent(
         taskId !== undefined
           ? withTaskStatus(snapshot, taskId, "ready-for-review")
           : snapshot
+      // M3: after a rejected gate round, ready_for_review opens a FRESH gate —
+      // drop the old reviewers/findings/worktree so actionsFor re-issues
+      // review.start. reviewRetries survives: it caps total rejection rounds.
+      if (taskId !== undefined) {
+        const task = next.tasks[taskId]
+        if (task !== undefined && (task.reviewRetries ?? 0) > 0) {
+          next = clearTaskFields(next, taskId, [
+            "reviewers",
+            "reviewFindings",
+            "reviewWorktreePath",
+          ])
+        }
+      }
       if (agentId !== undefined) {
         next = patchAgent(next, agentId, { state: "ready-for-review" })
       }
@@ -774,21 +1007,112 @@ export function applyEvent(
       const zoneViolations = (snapshot.agents[agentId]?.zoneViolations ?? 0) + 1
       return patchAgent(snapshot, agentId, { zoneViolations })
     }
-    case "review.assigned":
+    case "review.assigned": {
+      // Payload carries the reviewer rows ({ idx, role, sessionId }) plus the
+      // review worktree path; taskId may live in the payload or the envelope.
+      const payloadTaskId = payload.taskId
+      const taskId =
+        evt.taskId ??
+        (typeof payloadTaskId === "string" ? payloadTaskId : undefined)
+      if (taskId === undefined) return snapshot
+      const reviewers = parseReviewers(payload.reviewers)
+      const worktreePath =
+        typeof payload.worktreePath === "string"
+          ? payload.worktreePath
+          : undefined
+      const existing = snapshot.tasks[taskId]
+      const task: TaskRunState = existing ?? {
+        id: taskId,
+        status: "reviewing",
+        role: "",
+        zone: [],
+      }
+      return setTask(snapshot, {
+        ...task,
+        status: "reviewing",
+        ...(reviewers !== undefined ? { reviewers } : {}),
+        ...(worktreePath !== undefined
+          ? { reviewWorktreePath: worktreePath }
+          : {}),
+      })
+    }
     case "review.started": {
       const taskId = evt.taskId
       return taskId === undefined
         ? snapshot
         : withTaskStatus(snapshot, taskId, "reviewing")
     }
+    case "review.submitted": {
+      // Payload is ReviewSubmission-shaped ({ reviewer, idx, verdict,
+      // findings, ... }). taskId is required; falls back to the agent's task.
+      const taskId =
+        evt.taskId ??
+        (evt.agentId !== undefined
+          ? snapshot.agents[evt.agentId]?.taskId
+          : undefined)
+      if (taskId === undefined) return snapshot
+      const idx = payload.idx
+      if (typeof idx !== "number") return snapshot
+      const reviewer = payload.reviewer
+      if (typeof reviewer !== "string") return snapshot
+      const verdict =
+        payload.verdict === "pass"
+          ? "pass"
+          : payload.verdict === "fail"
+            ? "fail"
+            : undefined
+      if (verdict === undefined) return snapshot
+      const findings = parseFindings(payload.findings)
+      const existing = snapshot.tasks[taskId]
+      const reviewers = [...(existing?.reviewers ?? [])]
+      const entryIdx = reviewers.findIndex((entry) => entry.idx === idx)
+      const prevEntry = entryIdx >= 0 ? reviewers[entryIdx] : undefined
+      if (prevEntry !== undefined) {
+        const merged: ReviewerEntry = {
+          ...prevEntry,
+          verdict,
+          submittedAt: evt.ts,
+        }
+        if (findings !== undefined) {
+          merged.findings = [...(prevEntry.findings ?? []), ...findings]
+        }
+        reviewers[entryIdx] = merged
+      } else {
+        reviewers.push({
+          idx,
+          role: reviewer,
+          verdict,
+          submittedAt: evt.ts,
+          ...(findings !== undefined ? { findings } : {}),
+        })
+      }
+      const reviewFindings = [
+        ...(existing?.reviewFindings ?? []),
+        ...(findings ?? []),
+      ]
+      const task: TaskRunState = existing ?? {
+        id: taskId,
+        status: "reviewing",
+        role: "",
+        zone: [],
+      }
+      return setTask(snapshot, { ...task, reviewers, reviewFindings })
+    }
     case "review.verdict": {
       const taskId = evt.taskId
       if (taskId === undefined) return snapshot
-      return withTaskStatus(
-        snapshot,
-        taskId,
-        payload.verdict === "pass" ? "approved" : "in-progress",
-      )
+      if (payload.verdict === "pass") {
+        // Keep reviewFindings: the decision record stays on the task.
+        return withTaskStatus(snapshot, taskId, "approved")
+      }
+      const reviewRetries = (snapshot.tasks[taskId]?.reviewRetries ?? 0) + 1
+      let next = withTaskStatus(snapshot, taskId, "in-progress")
+      next = patchTask(next, taskId, { reviewRetries })
+      const maxRetries = config?.review.maxRetries
+      if (maxRetries !== undefined && reviewRetries >= maxRetries) {
+        next = withTaskStatus(next, taskId, "blocked")
+      }
+      return next
     }
     case "telemetry.opencode": {
       // Any telemetry from an agent's OpenCode session counts as activity for
@@ -970,6 +1294,123 @@ export class RunDO extends DurableObject<Env> {
     void this.env.ARTIFACTS.put(key, JSON.stringify(body)).catch(() => {})
   }
 
+  // M3 — one review submission document per reviewer per gate round:
+  // artifacts/<runId>/review/<taskId>/<idx>-<reviewer>.json.
+  private logReviewSubmission(
+    evt: HamiltonEvent,
+    prev: RunSnapshot,
+    _next: RunSnapshot,
+  ): void {
+    const taskId =
+      evt.taskId ??
+      (evt.agentId !== undefined ? prev.agents[evt.agentId]?.taskId : undefined)
+    if (taskId === undefined) return
+    const payload = payloadRecord(evt.payload)
+    const idx = payload.idx
+    const reviewer = payload.reviewer
+    if (typeof idx !== "number" || typeof reviewer !== "string") return
+    const key = `artifacts/${evt.runId}/review/${taskId}/${idx}-${reviewer}.json`
+    const body = { ...payload, ts: evt.ts, seq: evt.seq }
+    void this.env.ARTIFACTS.put(key, JSON.stringify(body)).catch(() => {})
+  }
+
+  // M3 — the merge decision record: artifacts/<runId>/merge-log/<seq>-<taskId>.json.
+  private logMerge(evt: HamiltonEvent, snapshot: RunSnapshot): void {
+    const taskId = evt.taskId
+    if (taskId === undefined) return
+    const task = snapshot.tasks[taskId]
+    if (task === undefined) return
+    const payload = payloadRecord(evt.payload)
+    const commit = typeof payload.commit === "string" ? payload.commit : ""
+    const key = `artifacts/${evt.runId}/merge-log/${String(evt.seq).padStart(10, "0")}-${taskId}.json`
+    const body = {
+      commit,
+      branch: task.branch ?? "",
+      parent: snapshot.parent ?? "",
+    }
+    void this.env.ARTIFACTS.put(key, JSON.stringify(body)).catch(() => {})
+  }
+
+  // M3 — rebuild the batch of ReviewSubmissions for a gate round from the
+  // task's reviewer rows (verdicts + per-reviewer findings recorded by
+  // applyEvent), so decideGate can attribute findings by veto role.
+  private submissionsForTask(task: TaskRunState): ReviewSubmission[] {
+    const submissions: ReviewSubmission[] = []
+    for (const entry of task.reviewers ?? []) {
+      if (entry.verdict === undefined) continue
+      submissions.push({
+        reviewer: entry.role,
+        idx: entry.idx,
+        verdict: entry.verdict,
+        findings: entry.findings ?? [],
+      })
+    }
+    return submissions
+  }
+
+  // M3 — when the last reviewer of a gate round has submitted, DECIDE and
+  // emit the synthesized review.verdict back through the bus. The queue
+  // consumer feeds it to RunDO /event where the normal dedupe (dedupe:<id>)
+  // prevents double application, and applyEvent lands the task on
+  // approved/in-progress/blocked. The seq comes from the SAME shared counter
+  // the Core's bus uses (seq:<runId>:counter) so the synthesized event cannot
+  // collide with real bus events in the append-only log; a failed send is
+  // swallowed (the state machine already recorded the submissions; the
+  // verdict can be re-derived from the next review.submitted).
+  private async maybeEmitVerdict(
+    evt: HamiltonEvent,
+    snapshot: RunSnapshot,
+    lastSeq: number,
+  ): Promise<void> {
+    const taskId =
+      evt.taskId ??
+      (evt.agentId !== undefined
+        ? snapshot.agents[evt.agentId]?.taskId
+        : undefined)
+    if (taskId === undefined) return
+    const task = snapshot.tasks[taskId]
+    if (task === undefined) return
+    const reviewers = task.reviewers ?? []
+    if (reviewers.length === 0) return
+    if (reviewers.some((entry) => entry.verdict === undefined)) return
+    const decision = decideGate(this.submissionsForTask(task), this.config)
+    // Shared seq counter (same key the Core bus uses): get+put race with the
+    // Core is possible but rare in-process; dedupe-by-id protects RunDO.
+    const counterKey = `seq:${evt.runId}:counter`
+    const rawCounter = await this.env.REGISTRY.get(counterKey)
+    const nextSeq =
+      rawCounter === null ? 1 : Number.parseInt(rawCounter, 10) + 1
+    await this.env.REGISTRY.put(counterKey, String(nextSeq))
+    const verdictSeq = Math.max(nextSeq, lastSeq + 1)
+    const verdictEvent: HamiltonEvent = {
+      id: crypto.randomUUID(),
+      type: "review.verdict",
+      ts: new Date().toISOString(),
+      runId: evt.runId,
+      taskId,
+      // Must exceed the last seq RunDO has applied (the incoming submission's
+      // own seq) or the /event seq check would dedupe it.
+      seq: verdictSeq,
+      payload: {
+        verdict: decision.verdict,
+        findings: decision.blockers,
+        retries:
+          decision.verdict === "fail"
+            ? (task.reviewRetries ?? 0) + 1
+            : (task.reviewRetries ?? 0),
+      },
+    }
+    // The verdict must ALSO land in the Core's event log (EVENTS KV) so the
+    // dashboard tail and /api/events see it — BUS.send alone reaches RunDO
+    // but bypasses the append-only log.
+    const verdictLogKey = `evt:${evt.runId}:${String(verdictSeq).padStart(10, "0")}`
+    await this.env.EVENTS.put(
+      verdictLogKey,
+      JSON.stringify(verdictEvent),
+    ).catch(() => {})
+    await this.env.BUS.send(verdictEvent).catch(() => {})
+  }
+
   private async handleEvent(evt: HamiltonEvent): Promise<Response> {
     const lastSeq = (await this.ctx.storage.get<number>(KEYS.lastSeq)) ?? 0
     if (evt.seq <= lastSeq) {
@@ -1002,6 +1443,12 @@ export class RunDO extends DurableObject<Env> {
     const supervised = this.supervise(evt, snapshot)
     const next = applyEvent(supervised, evt, this.config)
     this.logAgentArtifacts(evt)
+    if (evt.type === "review.submitted") {
+      this.logReviewSubmission(evt, supervised, next)
+      await this.maybeEmitVerdict(evt, next, lastSeq)
+    } else if (evt.type === "task.merged") {
+      this.logMerge(evt, next)
+    }
     let nextGraph = graph ?? []
     if (evt.type === "task.dispatched") {
       const parsed =
@@ -1035,6 +1482,22 @@ export class RunDO extends DurableObject<Env> {
     )
     for (const target of forwardTargets(snapshot, next, evt)) {
       this.fire(target, evt.runId)
+    }
+    // A re-ready after rejection opens a fresh gate round: drop the issued
+    // markers for review.start and session.nudge so the next maybeAct pass
+    // can re-issue them (the 24h TTL would otherwise block the re-review).
+    if (evt.type === "agent.ready_for_review" && evt.taskId !== undefined) {
+      const task = next.tasks[evt.taskId]
+      if (task !== undefined && (task.reviewRetries ?? 0) > 0) {
+        await Promise.allSettled([
+          this.env.REGISTRY.delete(
+            `issued:${evt.runId}:${evt.taskId}:review.start`,
+          ),
+          this.env.REGISTRY.delete(
+            `issued:${evt.runId}:${evt.taskId}:session.nudge`,
+          ),
+        ])
+      }
     }
     await this.maybeAct(next, evt.runId)
     return Response.json({ ok: true })

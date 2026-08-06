@@ -7,6 +7,8 @@ import { describe, expect, mock, test } from "bun:test"
 import type {
   HamiltonConfig,
   HamiltonEvent,
+  ReviewFinding,
+  ReviewSubmission,
   Task,
   TaskStatus,
 } from "@hamilton/shared"
@@ -25,6 +27,7 @@ const {
   agentActivity,
   agentLogKey,
   applyEvent,
+  decideGate,
   dispatchCandidates,
   extractBashCommand,
   findZoneViolation,
@@ -584,6 +587,14 @@ const plannedTask = (id: string, dependsOn: string[] = []): TaskRunState => ({
 const readyTask = (id: string, branch: string): TaskRunState => ({
   id,
   status: "ready-for-review" as TaskStatus,
+  role: "implementer",
+  zone: [],
+  branch,
+})
+
+const approvedTask = (id: string, branch: string): TaskRunState => ({
+  id,
+  status: "approved" as TaskStatus,
   role: "implementer",
   zone: [],
   branch,
@@ -1262,11 +1273,11 @@ describe("shouldMerge / mergeTrigger", () => {
     failedRatio: 0.5,
   })
 
-  test("autonomous + ready-for-review → merge with branch and parent", () => {
+  test("autonomous + approved → merge with branch and parent", () => {
     const snapshot = {
       ...empty,
       parent: "main",
-      tasks: { t1: readyTask("t1", "feat/t1") },
+      tasks: { t1: approvedTask("t1", "feat/t1") },
       phase: "running",
     }
     expect(shouldMerge(snapshot, "t1", autonomous)).toBe(true)
@@ -1275,18 +1286,29 @@ describe("shouldMerge / mergeTrigger", () => {
     ])
   })
 
-  test("owner-gated → no merges", () => {
+  test("autonomous + ready-for-review → no merge (the M3 gate replaced it)", () => {
     const snapshot = {
       ...empty,
       parent: "main",
       tasks: { t1: readyTask("t1", "feat/t1") },
       phase: "running",
     }
+    expect(shouldMerge(snapshot, "t1", autonomous)).toBe(false)
+    expect(mergeTrigger(snapshot, autonomous)).toEqual([])
+  })
+
+  test("owner-gated → no merges", () => {
+    const snapshot = {
+      ...empty,
+      parent: "main",
+      tasks: { t1: approvedTask("t1", "feat/t1") },
+      phase: "running",
+    }
     expect(shouldMerge(snapshot, "t1", ownerGated)).toBe(false)
     expect(mergeTrigger(snapshot, ownerGated)).toEqual([])
   })
 
-  test("non-ready tasks are not merged", () => {
+  test("non-approved tasks are not merged", () => {
     const snapshot = {
       ...empty,
       parent: "main",
@@ -1305,14 +1327,14 @@ describe("shouldMerge / mergeTrigger", () => {
     expect(mergeTrigger(snapshot, autonomous)).toEqual([])
   })
 
-  test("ready task without a branch is skipped", () => {
+  test("approved task without a branch is skipped", () => {
     const snapshot = {
       ...empty,
       parent: "main",
       tasks: {
         t1: {
           id: "t1",
-          status: "ready-for-review" as TaskStatus,
+          status: "approved" as TaskStatus,
           role: "",
           zone: [],
         },
@@ -1323,7 +1345,10 @@ describe("shouldMerge / mergeTrigger", () => {
   })
 
   test("no run parent → no merges", () => {
-    const snapshot = { ...empty, tasks: { t1: readyTask("t1", "feat/t1") } }
+    const snapshot = {
+      ...empty,
+      tasks: { t1: approvedTask("t1", "feat/t1") },
+    }
     expect(mergeTrigger(snapshot, autonomous)).toEqual([])
   })
 })
@@ -1331,7 +1356,7 @@ describe("shouldMerge / mergeTrigger", () => {
 describe("actionsFor", () => {
   const autonomous = autonomousConfig()
 
-  test("worktree.ensure for unblocked planned tasks, merge.execute for ready", () => {
+  test("worktree.ensure for planned, review.start for ready tasks", () => {
     const snapshot = {
       runId: "run-1",
       ...empty,
@@ -1365,11 +1390,13 @@ describe("actionsFor", () => {
         branch: "feat/t1",
       },
       {
-        action: "merge.execute",
+        action: "review.start",
         runId: "run-1",
         taskId: "t2",
         branch: "feat/t2",
         parent: "main",
+        roles: ["correctness", "standards"],
+        zone: [],
       },
     ])
   })
@@ -1616,5 +1643,631 @@ describe("run finish transition", () => {
     }
     const next = applyEvent(start, evt("task.merged", { taskId: "t1" }))
     expect(next.phase).not.toBe("finished")
+  })
+})
+
+const gateFinding = (id: string): ReviewFinding => ({
+  id,
+  location: "a.ts:1",
+  issue: `issue ${id}`,
+})
+
+const gateSubmission = (
+  reviewer: string,
+  verdict: "pass" | "fail",
+  findings: ReviewFinding[] = [],
+): ReviewSubmission => ({ reviewer, idx: 0, verdict, findings })
+
+describe("decideGate", () => {
+  const gateConfig = (vetoRoles: string[]): HamiltonConfig => ({
+    ...testConfig({ enabled: false, maxFailedAgents: 2, failedRatio: 0.5 }),
+    review: {
+      roles: ["correctness", "standards", "security"],
+      vetoRoles,
+      maxRetries: 2,
+    },
+  })
+
+  test("all pass → pass; notes carry every reviewer's findings", () => {
+    const decision = decideGate(
+      [
+        gateSubmission("correctness", "pass", [gateFinding("C-1")]),
+        gateSubmission("standards", "pass", [gateFinding("S-1")]),
+      ],
+      gateConfig(["security"]),
+    )
+    expect(decision.verdict).toBe("pass")
+    expect(decision.blockers).toEqual([])
+    expect(decision.notes.map((n) => n.id)).toEqual(["C-1", "S-1"])
+  })
+
+  test("veto-role fail → fail with its findings as blockers", () => {
+    const decision = decideGate(
+      [
+        gateSubmission("correctness", "pass", [gateFinding("C-1")]),
+        gateSubmission("security", "fail", [gateFinding("SEC-1")]),
+      ],
+      gateConfig(["security"]),
+    )
+    expect(decision.verdict).toBe("fail")
+    expect(decision.blockers.map((b) => b.id)).toEqual(["SEC-1"])
+    expect(decision.notes.map((n) => n.id)).toEqual(["C-1"])
+  })
+
+  test("advisory (non-veto) fail plus passes → pass with notes", () => {
+    const decision = decideGate(
+      [
+        gateSubmission("correctness", "fail", [gateFinding("C-1")]),
+        gateSubmission("standards", "pass"),
+        gateSubmission("security", "pass", [gateFinding("S-1")]),
+      ],
+      gateConfig(["security"]),
+    )
+    expect(decision.verdict).toBe("pass")
+    expect(decision.blockers).toEqual([])
+    expect(decision.notes.map((n) => n.id)).toEqual(["C-1", "S-1"])
+  })
+
+  test('"*" in vetoRoles makes every role veto', () => {
+    const decision = decideGate(
+      [gateSubmission("correctness", "fail", [gateFinding("C-1")])],
+      gateConfig(["*"]),
+    )
+    expect(decision.verdict).toBe("fail")
+    expect(decision.blockers.map((b) => b.id)).toEqual(["C-1"])
+    expect(decision.notes).toEqual([])
+  })
+
+  test("no submissions → fail-closed", () => {
+    expect(decideGate([], gateConfig(["security"]))).toEqual({
+      verdict: "fail",
+      blockers: [],
+      notes: [],
+    })
+  })
+})
+
+describe("review gate applyEvent", () => {
+  const cfg = testConfig({
+    enabled: false,
+    maxFailedAgents: 2,
+    failedRatio: 0.5,
+  })
+
+  test("review.assigned stores reviewers + worktree path and moves to reviewing", () => {
+    const next = applyEvent(
+      empty,
+      evt("review.assigned", {
+        taskId: "t1",
+        payload: {
+          reviewers: [
+            { idx: 0, role: "correctness", sessionId: "s0" },
+            { idx: 1, role: "standards", sessionId: "s1" },
+          ],
+          worktreePath: ".worktrees/t1-review",
+        },
+      }),
+    )
+    expect(next.tasks["t1"]?.status).toBe("reviewing")
+    expect(next.tasks["t1"]?.reviewers).toEqual([
+      { idx: 0, role: "correctness", sessionId: "s0" },
+      { idx: 1, role: "standards", sessionId: "s1" },
+    ])
+    expect(next.tasks["t1"]?.reviewWorktreePath).toBe(".worktrees/t1-review")
+  })
+
+  test("review.assigned accepts taskId from the payload", () => {
+    const next = applyEvent(
+      empty,
+      evt("review.assigned", {
+        payload: {
+          taskId: "t1",
+          reviewers: [{ idx: 0, role: "correctness" }],
+        },
+      }),
+    )
+    expect(next.tasks["t1"]?.status).toBe("reviewing")
+    expect(next.tasks["t1"]?.reviewers).toEqual([
+      { idx: 0, role: "correctness" },
+    ])
+  })
+
+  test("review.submitted records the verdict and accumulates findings", () => {
+    const assigned = applyEvent(
+      empty,
+      evt("review.assigned", {
+        taskId: "t1",
+        payload: {
+          reviewers: [
+            { idx: 0, role: "correctness", sessionId: "s0" },
+            { idx: 1, role: "standards", sessionId: "s1" },
+          ],
+        },
+      }),
+    )
+    const first = applyEvent(
+      assigned,
+      evt("review.submitted", {
+        taskId: "t1",
+        payload: {
+          reviewer: "correctness",
+          idx: 0,
+          verdict: "pass",
+          findings: [
+            { id: "C-1", location: "a.ts:1", issue: "nit" },
+            {
+              id: "C-2",
+              location: "b.ts:2",
+              issue: "nit2",
+              suggested_fix: "fix it",
+            },
+          ],
+        },
+      }),
+    )
+    expect(first.tasks["t1"]?.reviewers?.[0]).toMatchObject({
+      idx: 0,
+      role: "correctness",
+      sessionId: "s0",
+      verdict: "pass",
+      submittedAt: "2026-08-06T00:00:00.000Z",
+      findings: [
+        { id: "C-1", location: "a.ts:1", issue: "nit" },
+        {
+          id: "C-2",
+          location: "b.ts:2",
+          issue: "nit2",
+          suggested_fix: "fix it",
+        },
+      ],
+    })
+    expect(first.tasks["t1"]?.reviewFindings?.map((f) => f.id)).toEqual([
+      "C-1",
+      "C-2",
+    ])
+    const second = applyEvent(
+      first,
+      evt("review.submitted", {
+        taskId: "t1",
+        payload: {
+          reviewer: "standards",
+          idx: 1,
+          verdict: "fail",
+          findings: [{ id: "S-1", location: "c.ts:3", issue: "bad" }],
+        },
+      }),
+    )
+    expect(second.tasks["t1"]?.reviewers?.[1]?.verdict).toBe("fail")
+    expect(second.tasks["t1"]?.reviewFindings?.map((f) => f.id)).toEqual([
+      "C-1",
+      "C-2",
+      "S-1",
+    ])
+  })
+
+  test("review.submitted falls back to the agent's task when taskId is absent", () => {
+    const start = {
+      ...empty,
+      tasks: {
+        t1: {
+          id: "t1",
+          status: "reviewing" as TaskStatus,
+          role: "",
+          zone: [],
+          reviewers: [{ idx: 0, role: "correctness" }],
+        },
+      },
+      agents: { a1: agentState("a1", "working", { taskId: "t1" }) },
+    }
+    const next = applyEvent(
+      start,
+      evt("review.submitted", {
+        agentId: "a1",
+        payload: {
+          reviewer: "correctness",
+          idx: 0,
+          verdict: "pass",
+          findings: [],
+        },
+      }),
+    )
+    expect(next.tasks["t1"]?.reviewers?.[0]?.verdict).toBe("pass")
+  })
+
+  test("review.verdict fail increments retries; at maxRetries blocks the task", () => {
+    const start = {
+      ...empty,
+      tasks: {
+        t1: {
+          id: "t1",
+          status: "reviewing" as TaskStatus,
+          role: "",
+          zone: [],
+        },
+      },
+    }
+    const once = applyEvent(
+      start,
+      evt("review.verdict", { taskId: "t1", payload: { verdict: "fail" } }),
+      cfg,
+    )
+    expect(once.tasks["t1"]?.status).toBe("in-progress")
+    expect(once.tasks["t1"]?.reviewRetries).toBe(1)
+    const twice = applyEvent(
+      once,
+      evt("review.verdict", { taskId: "t1", payload: { verdict: "fail" } }),
+      cfg,
+    )
+    expect(twice.tasks["t1"]?.reviewRetries).toBe(2)
+    expect(twice.tasks["t1"]?.status).toBe("blocked")
+  })
+
+  test("review.verdict pass approves and keeps the accumulated findings", () => {
+    const start = {
+      ...empty,
+      tasks: {
+        t1: {
+          id: "t1",
+          status: "reviewing" as TaskStatus,
+          role: "",
+          zone: [],
+          reviewFindings: [{ id: "C-1", location: "a.ts", issue: "nit" }],
+        },
+      },
+    }
+    const next = applyEvent(
+      start,
+      evt("review.verdict", { taskId: "t1", payload: { verdict: "pass" } }),
+      cfg,
+    )
+    expect(next.tasks["t1"]?.status).toBe("approved")
+    expect(next.tasks["t1"]?.reviewFindings).toEqual([
+      { id: "C-1", location: "a.ts", issue: "nit" },
+    ])
+  })
+
+  test("ready_for_review after a rejection clears the gate for a fresh round", () => {
+    const start = {
+      ...empty,
+      tasks: {
+        t1: {
+          id: "t1",
+          status: "in-progress" as TaskStatus,
+          role: "",
+          zone: [],
+          reviewRetries: 1,
+          reviewers: [
+            {
+              idx: 0,
+              role: "correctness",
+              verdict: "fail" as const,
+              submittedAt: "x",
+            },
+          ],
+          reviewFindings: [{ id: "S-1", location: "c.ts", issue: "bad" }],
+          reviewWorktreePath: ".worktrees/t1-review",
+        },
+      },
+      agents: { a1: agentState("a1", "started", { taskId: "t1" }) },
+    }
+    const next = applyEvent(
+      start,
+      evt("agent.ready_for_review", { agentId: "a1", taskId: "t1" }),
+    )
+    expect(next.tasks["t1"]?.status).toBe("ready-for-review")
+    expect(next.tasks["t1"]?.reviewers).toBeUndefined()
+    expect(next.tasks["t1"]?.reviewFindings).toBeUndefined()
+    expect(next.tasks["t1"]?.reviewWorktreePath).toBeUndefined()
+    expect(next.tasks["t1"]?.reviewRetries).toBe(1)
+  })
+
+  test("first ready_for_review leaves a task with no gate state untouched", () => {
+    const start = {
+      ...empty,
+      tasks: {
+        t1: {
+          id: "t1",
+          status: "in-progress" as TaskStatus,
+          role: "",
+          zone: [],
+        },
+      },
+    }
+    const next = applyEvent(
+      start,
+      evt("agent.ready_for_review", { agentId: "a1", taskId: "t1" }),
+    )
+    expect(next.tasks["t1"]?.status).toBe("ready-for-review")
+    expect(next.tasks["t1"]?.reviewRetries).toBeUndefined()
+    expect(next.tasks["t1"]?.reviewers).toBeUndefined()
+  })
+})
+
+describe("actionsFor review gating", () => {
+  const autonomous = autonomousConfig()
+  const ownerGated = testConfig({
+    enabled: false,
+    maxFailedAgents: 2,
+    failedRatio: 0.5,
+  })
+
+  const reviewConfig = (model?: string): HamiltonConfig => ({
+    ...autonomous,
+    review: {
+      roles: ["correctness", "standards"],
+      vetoRoles: ["*"],
+      maxRetries: 2,
+      ...(model !== undefined ? { model } : {}),
+    },
+  })
+
+  test("ready-for-review without reviewers issues review.start with roles/zone/parent", () => {
+    const snapshot = {
+      runId: "run-1",
+      ...empty,
+      parent: "main",
+      tasks: {
+        t1: {
+          id: "t1",
+          status: "ready-for-review" as TaskStatus,
+          role: "implementer",
+          zone: ["packages/core/src"],
+          branch: "feat/t1",
+        },
+      },
+      phase: "running",
+    }
+    expect(actionsFor(snapshot, reviewConfig())).toEqual([
+      {
+        action: "review.start",
+        runId: "run-1",
+        taskId: "t1",
+        branch: "feat/t1",
+        parent: "main",
+        roles: ["correctness", "standards"],
+        zone: ["packages/core/src"],
+      },
+    ])
+  })
+
+  test("review.start carries the configured model when set", () => {
+    const snapshot = {
+      runId: "run-1",
+      ...empty,
+      parent: "main",
+      tasks: {
+        t1: {
+          id: "t1",
+          status: "ready-for-review" as TaskStatus,
+          role: "",
+          zone: [],
+          branch: "feat/t1",
+        },
+      },
+      phase: "running",
+    }
+    expect(actionsFor(snapshot, reviewConfig("claude-sonnet"))).toEqual([
+      {
+        action: "review.start",
+        runId: "run-1",
+        taskId: "t1",
+        branch: "feat/t1",
+        parent: "main",
+        roles: ["correctness", "standards"],
+        model: "claude-sonnet",
+        zone: [],
+      },
+    ])
+  })
+
+  test("ready-for-review with reviewers recorded does not re-issue review.start", () => {
+    const snapshot = {
+      runId: "run-1",
+      ...empty,
+      parent: "main",
+      tasks: {
+        t1: {
+          id: "t1",
+          status: "ready-for-review" as TaskStatus,
+          role: "",
+          zone: [],
+          branch: "feat/t1",
+          reviewers: [{ idx: 0, role: "correctness" }],
+        },
+      },
+      phase: "running",
+    }
+    expect(actionsFor(snapshot, autonomous)).toEqual([])
+  })
+
+  test("approved + autonomous → merge.execute; ready-for-review never merges", () => {
+    const approved = {
+      runId: "run-1",
+      ...empty,
+      parent: "main",
+      tasks: { t1: approvedTask("t1", "feat/t1") },
+      phase: "running",
+    }
+    expect(actionsFor(approved, autonomous)).toEqual([
+      {
+        action: "merge.execute",
+        runId: "run-1",
+        taskId: "t1",
+        branch: "feat/t1",
+        parent: "main",
+      },
+    ])
+    const ready = { ...approved, tasks: { t1: readyTask("t1", "feat/t1") } }
+    expect(
+      actionsFor(ready, autonomous).some((a) => a.action === "merge.execute"),
+    ).toBe(false)
+  })
+
+  test("approved + owner-gated → no merge", () => {
+    const snapshot = {
+      runId: "run-1",
+      ...empty,
+      parent: "main",
+      tasks: { t1: approvedTask("t1", "feat/t1") },
+      phase: "running",
+    }
+    expect(actionsFor(snapshot, ownerGated)).toEqual([])
+  })
+
+  test("in-progress after a rejection → session.nudge with rendered findings", () => {
+    const snapshot = {
+      runId: "run-1",
+      ...empty,
+      tasks: {
+        t1: {
+          id: "t1",
+          status: "in-progress" as TaskStatus,
+          role: "",
+          zone: [],
+          reviewRetries: 1,
+          reviewFindings: [
+            {
+              id: "SEC-1",
+              location: "api/login.ts:42",
+              issue: "missing validation",
+              suggested_fix: "validate the input",
+            },
+            { id: "C-1", location: "a.ts:1", issue: "nit" },
+          ],
+        },
+      },
+      phase: "running",
+    }
+    expect(actionsFor(snapshot, autonomous)).toEqual([
+      {
+        action: "session.nudge",
+        runId: "run-1",
+        taskId: "t1",
+        message:
+          "Review rejected (attempt 1). Findings:\n" +
+          "- [SEC-1] api/login.ts:42: missing validation (suggested: validate the input)\n" +
+          "- [C-1] a.ts:1: nit",
+      },
+    ])
+  })
+
+  test("nudge message caps findings at 20", () => {
+    const findings = Array.from({ length: 25 }, (_, i) => ({
+      id: `F-${i}`,
+      location: "a.ts",
+      issue: `issue ${i}`,
+    }))
+    const snapshot = {
+      runId: "run-1",
+      ...empty,
+      tasks: {
+        t1: {
+          id: "t1",
+          status: "in-progress" as TaskStatus,
+          role: "",
+          zone: [],
+          reviewRetries: 1,
+          reviewFindings: findings,
+        },
+      },
+      phase: "running",
+    }
+    const actions = actionsFor(snapshot, autonomous)
+    expect(actions).toHaveLength(1)
+    const action = actions[0]
+    if (action === undefined || action.action !== "session.nudge") {
+      throw new Error("expected a session.nudge action")
+    }
+    const lines = action.message.split("\n")
+    expect(lines).toHaveLength(21)
+    expect(lines[1]).toBe("- [F-0] a.ts: issue 0")
+    expect(lines[20]).toBe("- [F-19] a.ts: issue 19")
+    expect(action.message).not.toContain("F-20")
+  })
+
+  test("no nudge when a rejected task has no findings", () => {
+    const snapshot = {
+      runId: "run-1",
+      ...empty,
+      tasks: {
+        t1: {
+          id: "t1",
+          status: "in-progress" as TaskStatus,
+          role: "",
+          zone: [],
+          reviewRetries: 1,
+        },
+      },
+      phase: "running",
+    }
+    expect(actionsFor(snapshot, autonomous)).toEqual([])
+  })
+
+  test("approved with a review worktree → review.cleanup alongside the merge", () => {
+    const snapshot = {
+      runId: "run-1",
+      ...empty,
+      parent: "main",
+      tasks: {
+        t1: {
+          id: "t1",
+          status: "approved" as TaskStatus,
+          role: "",
+          zone: [],
+          branch: "feat/t1",
+          reviewWorktreePath: ".worktrees/t1-review",
+        },
+      },
+      phase: "running",
+    }
+    expect(actionsFor(snapshot, autonomous)).toEqual([
+      {
+        action: "merge.execute",
+        runId: "run-1",
+        taskId: "t1",
+        branch: "feat/t1",
+        parent: "main",
+      },
+      { action: "review.cleanup", runId: "run-1", taskId: "t1" },
+    ])
+  })
+
+  test("blocked with a review worktree → review.cleanup", () => {
+    const snapshot = {
+      runId: "run-1",
+      ...empty,
+      tasks: {
+        t1: {
+          id: "t1",
+          status: "blocked" as TaskStatus,
+          role: "",
+          zone: [],
+          reviewWorktreePath: ".worktrees/t1-review",
+        },
+      },
+      phase: "running",
+    }
+    expect(actionsFor(snapshot, autonomous)).toEqual([
+      { action: "review.cleanup", runId: "run-1", taskId: "t1" },
+    ])
+  })
+
+  test("approved without a review worktree gets no cleanup", () => {
+    const snapshot = {
+      runId: "run-1",
+      ...empty,
+      parent: "main",
+      tasks: { t1: approvedTask("t1", "feat/t1") },
+      phase: "running",
+    }
+    expect(actionsFor(snapshot, autonomous)).toEqual([
+      {
+        action: "merge.execute",
+        runId: "run-1",
+        taskId: "t1",
+        branch: "feat/t1",
+        parent: "main",
+      },
+    ])
   })
 })
