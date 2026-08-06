@@ -3,13 +3,14 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { Task, TaskGraph } from "@hamilton/shared"
-import type { Decomposer } from "./planner.ts"
+import type { Decomposer, ReviewBriefContext } from "./planner.ts"
 import {
   normalizeGraph,
   planFromFile,
   planFromPrompt,
   renderBrief,
   renderGraphYaml,
+  renderReviewBrief,
   validateGraph,
 } from "./planner.ts"
 
@@ -213,6 +214,64 @@ describe("renderBrief", () => {
   test("uses the task's own pr_title when present", () => {
     const brief = renderBrief(task({ pr_title: "feat(t1): custom title" }), ctx)
     expect(brief).toContain("feat(t1): custom title")
+  })
+})
+
+describe("renderReviewBrief", () => {
+  const reviewCtx: ReviewBriefContext = {
+    task: task(),
+    role: "security",
+    parent: "main",
+    branch: "feat/t1",
+    worktreePath: "/repo/.worktrees/t1",
+    instructions: "Review the diff. Check auth. Be strict.",
+    readSummary:
+      "### Diff facts\n- 3 files changed\n- Zone: packages/core/src\n### Commits\n- c1: add login flow",
+  }
+
+  test("contains role, task id, and the title", () => {
+    const brief = renderReviewBrief(reviewCtx)
+    expect(brief).toContain("# REVIEW BRIEF — t1 (security)")
+  })
+
+  test("contains the instructions verbatim", () => {
+    const brief = renderReviewBrief(reviewCtx)
+    expect(brief).toContain("Review the diff. Check auth. Be strict.")
+  })
+
+  test("contains task contract inputs, outputs, and zone entries", () => {
+    const brief = renderReviewBrief(reviewCtx)
+    expect(brief).toContain("doc §1")
+    expect(brief).toContain("- feature")
+    expect(brief).toContain("- `packages/core/src`")
+  })
+
+  test("contains the READ summary marker", () => {
+    const brief = renderReviewBrief(reviewCtx)
+    expect(brief).toContain("READ summary (deterministic facts)")
+    expect(brief).toContain("### Diff facts")
+  })
+
+  test("contains worktree, branch, and parent", () => {
+    const brief = renderReviewBrief(reviewCtx)
+    expect(brief).toContain("/repo/.worktrees/t1")
+    expect(brief).toContain("feat/t1")
+    expect(brief).toContain("main")
+  })
+
+  test("mentions submit_review with findings and verdict", () => {
+    const brief = renderReviewBrief(reviewCtx)
+    expect(brief).toContain("submit_review")
+    expect(brief).toContain("suggested_fix")
+    expect(brief).toContain("verdict")
+  })
+
+  test("covers the check process in the worktree", () => {
+    const brief = renderReviewBrief(reviewCtx)
+    expect(brief).toContain("pnpm typecheck")
+    expect(brief).toContain("pnpm format:check")
+    expect(brief).toContain("pnpm test")
+    expect(brief).toContain("write them first")
   })
 })
 

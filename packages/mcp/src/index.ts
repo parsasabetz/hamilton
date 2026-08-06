@@ -65,6 +65,38 @@ interface ReadyForReviewArgs {
   checks?: Record<string, unknown>
 }
 
+export interface SubmitReviewArgs {
+  reviewer: string
+  verdict: "pass" | "fail"
+  findings?: Array<{
+    id: string
+    location: string
+    issue: string
+    suggested_fix?: string
+  }>
+  checksRun?: Array<{ name: string; ok: boolean }>
+  testsWritten?: string[]
+  summary?: string
+}
+
+// M3 — the review.submitted payload builder; findings default to [] (the zod
+// spec's .default([]) carries through), everything else stays omitted when
+// undefined.
+export function submitReviewPayload(
+  args: SubmitReviewArgs,
+): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
+    reviewer: args.reviewer,
+    verdict: args.verdict,
+    findings: args.findings ?? [],
+  }
+  if (args.checksRun !== undefined) payload["checksRun"] = args.checksRun
+  if (args.testsWritten !== undefined)
+    payload["testsWritten"] = args.testsWritten
+  if (args.summary !== undefined) payload["summary"] = args.summary
+  return payload
+}
+
 function toolSpec(name: HamiltonToolName): HamiltonToolSpec {
   const spec = hamiltonToolSpecs.find((candidate) => candidate.name === name)
   if (spec === undefined) {
@@ -234,6 +266,25 @@ export function createMcpServer(): McpServer {
         readyForReview.name,
         "agent.ready_for_review",
         payload,
+      )
+    },
+  )
+
+  const submitReview = toolSpec("submit_review")
+  server.registerTool(
+    submitReview.name,
+    {
+      title: submitReview.name,
+      description: submitReview.description,
+      inputSchema: submitReview.inputSchema,
+    },
+    async (args: unknown): Promise<CallToolResult> => {
+      const review = args as SubmitReviewArgs
+      return emitAndRespond(
+        shim,
+        submitReview.name,
+        "review.submitted",
+        submitReviewPayload(review),
       )
     },
   )

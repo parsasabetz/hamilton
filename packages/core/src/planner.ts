@@ -258,7 +258,81 @@ export function renderBrief(task: Task, ctx: BriefContext): string {
 }
 
 // ---------------------------------------------------------------------------
-// 4. LLM-assisted decomposition (injectable; the only non-deterministic part)
+// 4. Review brief generation (deterministic markdown, M3)
+// ---------------------------------------------------------------------------
+
+export interface ReviewBriefContext {
+  task: Task
+  role: string
+  parent: string
+  branch: string
+  worktreePath: string
+  // .hamilton/reviewer-agent.md body (constants layer) — included verbatim.
+  instructions: string
+  // Deterministic READ facts summary (diff/zone/commits).
+  readSummary: string
+}
+
+export function renderReviewBrief(ctx: ReviewBriefContext): string {
+  const {
+    task,
+    role,
+    parent,
+    branch,
+    worktreePath,
+    instructions,
+    readSummary,
+  } = ctx
+  const zoneLines =
+    task.zone.length > 0
+      ? task.zone.map((entry) => `  - \`${entry}\``).join("\n")
+      : "  - (none declared — review the whole diff against the contract)"
+  const inputLines =
+    task.contract.inputs.length > 0
+      ? task.contract.inputs.map((input) => `  - ${input}`).join("\n")
+      : "  - (none)"
+  const outputLines =
+    task.contract.outputs.length > 0
+      ? task.contract.outputs.map((output) => `  - ${output}`).join("\n")
+      : "  - (none)"
+
+  return [
+    `# REVIEW BRIEF — ${task.id} (${role})`,
+    "",
+    "## Instructions",
+    instructions,
+    "",
+    "## Task contract",
+    "### Inputs (the task was supposed to read these)",
+    inputLines,
+    "### Outputs (the task was supposed to produce these)",
+    outputLines,
+    "### Zone (expected scope)",
+    zoneLines,
+    "",
+    "## READ summary (deterministic facts)",
+    readSummary,
+    "",
+    "## Worktree",
+    `- Review the work in: \`${worktreePath}\`.`,
+    `- Branch: \`${branch}\` (parent \`${parent}\`).`,
+    "",
+    "## Run the check process (in the worktree)",
+    "1. `pnpm typecheck`",
+    "2. `pnpm format:check`",
+    "3. `pnpm test`",
+    "4. pre-commit hooks",
+    "- If the objective demands tests that are missing, write them first, then run the checks.",
+    "",
+    "## Submit your verdict",
+    "- Call `submit_review` with structured findings (id, location, issue, suggested_fix) for every problem found.",
+    "- Emit a verdict: `pass` only if the contract is met and all checks pass; otherwise `fail` with findings.",
+    "",
+  ].join("\n")
+}
+
+// ---------------------------------------------------------------------------
+// 5. LLM-assisted decomposition (injectable; the only non-deterministic part)
 // ---------------------------------------------------------------------------
 
 export interface Decomposer {
